@@ -1,9 +1,9 @@
-// Package features simulates the brain once for every position and caches what the
-// readout neurons did.
+// Package features simulates the brain once for every position of a game and caches what
+// the readout neurons did.
 //
-// Tic-tac-toe has 4,520 positions where someone must move, and the wiring never changes,
-// so every question we will ever ask the brain can be answered in advance. Training then
-// only needs table lookups.
+// The supported games have few positions where someone must move (tic-tac-toe: 4,520), and
+// the wiring never changes, so every question we will ever ask the brain can be answered in
+// advance. Training then only needs table lookups.
 package features
 
 import (
@@ -14,26 +14,37 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync/atomic"
 	"time"
 
 	"github.com/empire/fruit-fly/internal/game"
+	"github.com/empire/fruit-fly/internal/retina"
 	"github.com/empire/fruit-fly/internal/sim"
 )
 
 const magic = "FLYFEAT1"
 
-// Cache holds the brain's response to every decision position, in game.Positions() order.
+// Cache holds the brain's response to every decision position, in game.Tree row order.
 type Cache struct {
 	Ticks   int
 	Counts  [][]uint8    // [position][readout neuron] spike counts
 	Regions [][3][]int32 // [position][region][tick] spikes
 }
 
-// Compute simulates every position and writes the cache to path.
-func Compute(brain *sim.Brain, path string) (*Cache, error) {
-	positions := game.Positions()
+// stimuli is what the eyes see at every decision row.
+func stimuli(eyes *retina.Eyes, t *game.Tree) [][]sim.Input {
+	out := make([][]sim.Input, t.Decisions)
+	for row, obs := range t.Obs {
+		out[row] = eyes.Stimulus(obs)
+	}
+	return out
+}
+
+// Compute simulates every decision position of t and writes the cache to path.
+func Compute(brain *sim.Brain, eyes *retina.Eyes, t *game.Tree, path string) (*Cache, error) {
+	positions := stimuli(eyes, t)
 	var done atomic.Int64
 	start := time.Now()
 	stop := make(chan struct{})
@@ -64,6 +75,9 @@ func Compute(brain *sim.Brain, path string) (*Cache, error) {
 
 // Save writes the cache as little-endian binary.
 func (c *Cache) Save(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -91,11 +105,11 @@ func (c *Cache) Save(path string) error {
 	return err
 }
 
-// Load reads a cache written by Save.
-func Load(path string) (*Cache, error) {
+// Load reads a cache written by Save for the game t.
+func Load(path string, t *game.Tree) (*Cache, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("%w (run `fly features` first)", err)
+		return nil, fmt.Errorf("%w (run `fly features -game %s` first)", err, t.Name)
 	}
 	defer f.Close()
 	r := bufio.NewReader(f)
@@ -127,8 +141,8 @@ func Load(path string) (*Cache, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if len(c.Counts) != len(game.Positions()) {
-		return nil, fmt.Errorf("%s: %d positions, want %d", path, len(c.Counts), len(game.Positions()))
+	if len(c.Counts) != t.Decisions {
+		return nil, fmt.Errorf("%s: %d positions, want %d for %s", path, len(c.Counts), t.Decisions, t.Name)
 	}
 	return c, nil
 }
@@ -183,19 +197,20 @@ func Sanity(c *Cache) bool {
 	return ok
 }
 
-// Bench times single-board runs and the parallel full precompute estimate.
-func Bench(brain *sim.Brain) {
-	positions := game.Positions()
-	brain.Run(positions[100]) // warm up
+// Bench times single-board runs and estimates the full precompute for t.
+func Bench(brain *sim.Brain, eyes *retina.Eyes, t *game.Tree) {
+	positions := stimuli(eyes, t)
+	brain.Run(positions[len(positions)/2]) // warm up
 	start := time.Now()
 	const n = 4
 	for i := range n {
-		brain.Run(positions[i*1000])
+		brain.Run(positions[i*len(positions)/n])
 	}
 	one := time.Since(start) / n
 	start = time.Now()
-	brain.RunMany(positions[:64], nil)
-	many := time.Since(start) / 64
+	sample := min(64, len(positions))
+	brain.RunMany(positions[:sample], nil)
+	many := time.Since(start) / time.Duration(sample)
 	fmt.Printf("one board, one goroutine:  %v (%v per tick)\n", one.Round(time.Millisecond), (one / time.Duration(brain.P.Ticks)).Round(10*time.Microsecond))
 	fmt.Printf("parallel, per board:       %v\n", many.Round(time.Millisecond))
 	fmt.Printf("all %d positions:        ~%.0fs\n", len(positions), (many * time.Duration(len(positions))).Seconds())

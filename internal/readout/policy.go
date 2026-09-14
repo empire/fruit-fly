@@ -1,3 +1,15 @@
+// Package readout is the only part that learns: a linear map from features to a move.
+//
+//	scores = W · standardize(features[position]) + b     // one score per action
+//	illegal actions -> -Inf, softmax -> probabilities, sample (training) or argmax (playing)
+//
+// Training is REINFORCE: play a batch of games, then make each move the learner made more
+// likely in proportion to (final result − predicted result). The prediction comes from a
+// second linear head (the value baseline), which reduces noise. Gradients are written by
+// hand, because the model is small enough to derive them on paper (see Accumulate).
+//
+// Nothing here knows which game is played: positions are rows of a game.Tree, and the same
+// code trains a readout on any feature set (see package featureset).
 package readout
 
 import (
@@ -7,23 +19,30 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+
+	"github.com/empire/fruit-fly/internal/game"
 )
 
-// Readout is a linear policy head (9 cells) and a linear value head on standardized features.
+// Readout is a linear policy head (one per action) and a linear value head on standardized features.
 type Readout struct {
-	X [][]float64 // standardized features, [position][D]
-	D int
+	Tree *game.Tree
+	X    [][]float64 // standardized features, [row][D]
+	D    int         // features
+	A    int         // actions
 
-	W [9][]float64 // policy weights per cell
-	B [9]float64   // policy bias per cell
-	U []float64    // value weights
-	C float64      // value bias
+	W [][]float64 // [action][D] policy weights
+	B []float64   // [action] policy bias
+	U []float64   // value weights
+	C float64     // value bias
 }
 
-// New creates a readout that starts as a uniformly random player (all weights zero).
-func New(x [][]float64) *Readout {
-	r := &Readout{X: Standardize(x), D: len(x[0]), U: make([]float64, len(x[0]))}
-	for c := range 9 {
+// New creates a readout for t on features x ([row][D]) that starts as a uniformly random
+// player (all weights zero).
+func New(t *game.Tree, x [][]float64) *Readout {
+	r := &Readout{Tree: t, X: Standardize(x), D: len(x[0]), A: t.NumActions, U: make([]float64, len(x[0]))}
+	r.W, r.B = make([][]float64, r.A), make([]float64, r.A)
+	for c := range r.A {
 		r.W[c] = make([]float64, r.D)
 	}
 	return r
@@ -37,22 +56,22 @@ func dot(a, b []float64) float64 {
 	return s
 }
 
-// Probs returns move probabilities for a position; illegal cells get 0.
-func (r *Readout) Probs(row int) [9]float64 {
-	x, legal := r.X[row], GetTables().Legal[row]
-	var z [9]float64
+// Probs returns move probabilities for a position; illegal actions get 0.
+func (r *Readout) Probs(row int) []float64 {
+	x, next := r.X[row], r.Tree.Next[row]
+	z := make([]float64, r.A)
 	top := math.Inf(-1)
-	for c := range 9 {
-		if legal[c] {
+	for c := range r.A {
+		if next[c] >= 0 {
 			z[c] = dot(r.W[c], x) + r.B[c]
 			top = max(top, z[c])
 		}
 	}
 	// softmax, shifted by the largest score so exp() can't overflow
-	var p [9]float64
+	p := make([]float64, r.A)
 	sum := 0.0
-	for c := range 9 {
-		if legal[c] {
+	for c := range r.A {
+		if next[c] >= 0 {
 			p[c] = math.Exp(z[c] - top)
 			sum += p[c]
 		}
@@ -66,12 +85,12 @@ func (r *Readout) Probs(row int) [9]float64 {
 // Value predicts the result (+1 win … -1 loss) for the side to move.
 func (r *Readout) Value(row int) float64 { return dot(r.U, r.X[row]) + r.C }
 
-// Greedy returns the most likely legal cell.
+// Greedy returns the most likely legal action.
 func (r *Readout) Greedy(row int) int {
 	p := r.Probs(row)
 	best := -1
-	for c := range 9 {
-		if GetTables().Legal[row][c] && (best < 0 || p[c] > p[best]) {
+	for c := range r.A {
+		if r.Tree.Next[row][c] >= 0 && (best < 0 || p[c] > p[best]) {
 			best = c
 		}
 	}
@@ -82,25 +101,35 @@ func (r *Readout) Greedy(row int) int {
 type Sample struct {
 	Row    int
 	Action int
-	Return float64    // final result from the mover's point of view
-	Probs  [9]float64 // policy when the move was chosen
-	Value  float64    // value prediction when the move was chosen
+	Return float64   // final result from the mover's point of view
+	Probs  []float64 // policy when the move was chosen
+	Value  float64   // value prediction when the move was chosen
 }
 
 // Grad has the same shape as the readout's parameters.
 type Grad struct {
-	W [9][]float64
-	B [9]float64
+	W [][]float64
+	B []float64
 	U []float64
 	C float64
 }
 
-func newGrad(d int) *Grad {
-	g := &Grad{U: make([]float64, d)}
-	for c := range 9 {
+func newGrad(a, d int) *Grad {
+	g := &Grad{W: make([][]float64, a), B: make([]float64, a), U: make([]float64, d)}
+	for c := range a {
 		g.W[c] = make([]float64, d)
 	}
 	return g
+}
+
+// zero clears g for reuse.
+func (g *Grad) zero() {
+	for c := range g.W {
+		clear(g.W[c])
+	}
+	clear(g.B)
+	clear(g.U)
+	g.C = 0
 }
 
 // Accumulate adds one sample's gradient of the loss
@@ -124,10 +153,10 @@ func (r *Readout) Accumulate(g *Grad, s Sample, entropy float64) {
 			h -= p * math.Log(p)
 		}
 	}
-	for c := range 9 {
+	for c := range r.A {
 		p := s.Probs[c]
 		if p == 0 {
-			continue // illegal cell: its score never mattered
+			continue // illegal action: its score never mattered
 		}
 		onehot := 0.0
 		if c == s.Action {
@@ -153,8 +182,8 @@ type adam struct {
 	m, v             *Grad
 }
 
-func newAdam(d int, lr float64) *adam {
-	return &adam{lr: lr, beta1: 0.9, beta2: 0.999, m: newGrad(d), v: newGrad(d)}
+func newAdam(a, d int, lr float64) *adam {
+	return &adam{lr: lr, beta1: 0.9, beta2: 0.999, m: newGrad(a, d), v: newGrad(a, d)}
 }
 
 func (a *adam) step(r *Readout, g *Grad, scale float64) {
@@ -167,7 +196,7 @@ func (a *adam) step(r *Readout, g *Grad, scale float64) {
 		*v = a.beta2**v + (1-a.beta2)*gr*gr
 		*param -= a.lr * (*m / c1) / (math.Sqrt(*v/c2) + 1e-8)
 	}
-	for c := range 9 {
+	for c := range r.A {
 		for k := range r.W[c] {
 			update(&r.W[c][k], &g.W[c][k], &a.m.W[c][k], &a.v.W[c][k])
 		}
@@ -183,6 +212,9 @@ const readoutMagic = "FLYREAD1"
 
 // Save writes the policy weights (the value head is only needed during training).
 func (r *Readout) Save(path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -195,7 +227,7 @@ func (r *Readout) Save(path string) error {
 	}
 	put([]byte(readoutMagic))
 	put(int64(r.D))
-	for c := range 9 {
+	for c := range r.A {
 		put(r.W[c])
 	}
 	put(r.B)
@@ -208,11 +240,11 @@ func (r *Readout) Save(path string) error {
 	return err
 }
 
-// Load reads policy weights written by Save into a readout built on the same features.
+// Load reads policy weights written by Save into a readout built on the same game and features.
 func (r *Readout) Load(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("%w (run `fly train` first)", err)
+		return fmt.Errorf("%w (run `fly train -game %s` first)", err, r.Tree.Name)
 	}
 	defer f.Close()
 	rd := bufio.NewReader(f)
@@ -230,9 +262,48 @@ func (r *Readout) Load(path string) error {
 	if err == nil && int(d) != r.D {
 		return fmt.Errorf("%s: %d features, want %d", path, d, r.D)
 	}
-	for c := range 9 {
+	for c := range r.A {
 		get(r.W[c])
 	}
-	get(&r.B)
+	get(r.B)
+	if err == nil {
+		if _, extra := rd.ReadByte(); extra != io.EOF {
+			err = fmt.Errorf("%s: longer than %d actions x %d features (trained for another game?)", path, r.A, r.D)
+		}
+	}
 	return err
+}
+
+// Standardize rescales each feature to mean 0 and standard deviation 1 across positions,
+// so no feature dominates just because its numbers are bigger. Constant features become 0.
+func Standardize(x [][]float64) [][]float64 {
+	d := len(x[0])
+	mean, std := make([]float64, d), make([]float64, d)
+	for _, row := range x {
+		for k, v := range row {
+			mean[k] += v
+		}
+	}
+	for k := range mean {
+		mean[k] /= float64(len(x))
+	}
+	for _, row := range x {
+		for k, v := range row {
+			std[k] += (v - mean[k]) * (v - mean[k])
+		}
+	}
+	for k := range std {
+		std[k] = math.Sqrt(std[k] / float64(len(x)))
+		if std[k] == 0 {
+			std[k] = 1
+		}
+	}
+	out := make([][]float64, len(x))
+	for i, row := range x {
+		out[i] = make([]float64, d)
+		for k, v := range row {
+			out[i][k] = (v - mean[k]) / std[k]
+		}
+	}
+	return out
 }

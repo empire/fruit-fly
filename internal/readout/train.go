@@ -18,67 +18,59 @@ const (
 	Perfect
 )
 
-// Chooser picks a cell for a decision position (given by table row).
+// Chooser picks an action for a decision position (given by tree row).
 type Chooser func(row int, rng *rand.Rand) int
 
-func opponentMove(o Opponent, row int, rng *rand.Rand) int {
-	t := GetTables()
-	allowed := t.Legal[row]
+func opponentMove(t *game.Tree, o Opponent, row int, rng *rand.Rand) int {
 	if o == Perfect {
-		allowed = t.Best[row]
+		return game.PerfectMove(t, row, rng)
 	}
-	var cells []int
-	for c, ok := range allowed {
-		if ok {
-			cells = append(cells, c)
-		}
-	}
-	return cells[rng.IntN(len(cells))]
+	return game.RandomMove(t, row, rng)
 }
 
-// playGame plays one game and returns the result for X (+1, 0, -1).
-// If learn is set, it records every learner move as a Sample with its Return filled in.
-func playGame(fly Chooser, r *Readout, o Opponent, flyIsX bool, rng *rand.Rand, learn bool) (int, []Sample) {
-	t := GetTables()
+// playGame plays one game on t and returns the result for the first player (+1, 0, -1).
+// If learn is set, it records every learner move of r as a Sample with its Return filled in.
+func playGame(t *game.Tree, fly Chooser, r *Readout, o Opponent, flyFirst bool, rng *rand.Rand, learn bool) (int, []Sample) {
 	var (
-		pos     game.Pos
+		node    = t.Root
 		samples []Sample
 		steps   []int
 	)
 	for step := 0; ; step++ {
-		if v, over := pos.Terminal(); over {
-			outcomeX := v // v is for the side to move, which just lost or drew
+		if t.IsTerminal(node) {
+			v := int(t.Value[node]) // for the side to move
+			outcomeFirst := v
 			if step%2 == 1 {
-				outcomeX = -v
+				outcomeFirst = -v
 			}
 			for i := range samples {
-				samples[i].Return = float64(outcomeX)
-				if steps[i]%2 == 1 { // O moved: flip to O's point of view
+				samples[i].Return = float64(outcomeFirst)
+				if steps[i]%2 == 1 { // the second player moved: flip to their point of view
 					samples[i].Return = -samples[i].Return
 				}
 			}
-			return outcomeX, samples
+			return outcomeFirst, samples
 		}
-		row := t.RowOf(pos)
-		xMoves := step%2 == 0
-		var cell int
-		if o == Self || flyIsX == xMoves {
+		row := node
+		firstMoves := step%2 == 0
+		var action int
+		if o == Self || flyFirst == firstMoves {
 			if learn {
 				p := r.Probs(row)
-				cell = sampleCell(p, rng)
-				samples = append(samples, Sample{Row: row, Action: cell, Probs: p, Value: r.Value(row)})
+				action = sampleAction(p, rng)
+				samples = append(samples, Sample{Row: row, Action: action, Probs: p, Value: r.Value(row)})
 				steps = append(steps, step)
 			} else {
-				cell = fly(row, rng)
+				action = fly(row, rng)
 			}
 		} else {
-			cell = opponentMove(o, row, rng)
+			action = opponentMove(t, o, row, rng)
 		}
-		pos = pos.Play(cell)
+		node = int(t.Next[row][action])
 	}
 }
 
-func sampleCell(p [9]float64, rng *rand.Rand) int {
+func sampleAction(p []float64, rng *rand.Rand) int {
 	u := rng.Float64()
 	last := 0
 	for c, pc := range p {
@@ -109,15 +101,15 @@ func DefaultTrainConfig() TrainConfig {
 	return TrainConfig{Games: 300_000, Batch: 512, LR: 0.01, Entropy: 0.01, LogEvery: 50}
 }
 
-// Train learns a readout with self-play REINFORCE, rotating opponents between the learner
-// itself (teaches both sides), a random player and a perfect player (keep it honest).
-func Train(name string, x [][]float64, cfg TrainConfig) *Readout {
-	r := New(x)
-	opt := newAdam(r.D, cfg.LR)
+// Train learns a readout for t with self-play REINFORCE, rotating opponents between the
+// learner itself (teaches both sides), a random player and a perfect player (keep it honest).
+func Train(name string, t *game.Tree, x [][]float64, cfg TrainConfig) *Readout {
+	r := New(t, x)
+	opt := newAdam(r.A, r.D, cfg.LR)
 	workers := runtime.GOMAXPROCS(0)
 	grads := make([]*Grad, workers)
 	for w := range grads {
-		grads[w] = newGrad(r.D)
+		grads[w] = newGrad(r.A, r.D)
 	}
 	seedRng := rand.New(rand.NewPCG(cfg.Seed, 1))
 
@@ -130,13 +122,9 @@ func Train(name string, x [][]float64, cfg TrainConfig) *Readout {
 			wg.Go(func() {
 				rng := rand.New(rand.NewPCG(seed, uint64(w)))
 				g := grads[w]
-				*g = Grad{W: g.W, U: g.U} // zero the scalars, keep the slices
-				for c := range 9 {
-					clear(g.W[c])
-				}
-				clear(g.U)
+				g.zero()
 				for range cfg.Batch / workers {
-					_, samples := playGame(nil, r, opponent, rng.IntN(2) == 0, rng, true)
+					_, samples := playGame(t, nil, r, opponent, rng.IntN(2) == 0, rng, true)
 					for _, s := range samples {
 						r.Accumulate(g, s, cfg.Entropy)
 					}
@@ -146,11 +134,11 @@ func Train(name string, x [][]float64, cfg TrainConfig) *Readout {
 		}
 		wg.Wait()
 
-		total := newGrad(r.D)
+		total := newGrad(r.A, r.D)
 		n := 0
 		for w, g := range grads {
 			n += counts[w]
-			for c := range 9 {
+			for c := range r.A {
 				for k, v := range g.W[c] {
 					total.W[c][k] += v
 				}
@@ -164,7 +152,7 @@ func Train(name string, x [][]float64, cfg TrainConfig) *Readout {
 		opt.step(r, total, 1/float64(n))
 
 		if (it+1)%cfg.LogEvery == 0 {
-			s := Evaluate(r.Chooser(), 400, uint64(it))
+			s := Evaluate(t, r.Chooser(), 400, uint64(it))
 			fmt.Printf("[%s] games %8d  vs random: win %3.0f%%  vs perfect: loss %3.0f%%\n",
 				name, (it+1)*cfg.Batch, 100*s.VsRandom.Win, 100*s.VsPerfect.Loss)
 		}

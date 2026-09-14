@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 )
 
-const graphMagic = "FLYGRAPH1"
+const graphMagic = "FLYGRAPH2"
 
 // Save writes graph.bin (little-endian binary) and meta.json.
 func Save(dir string, g *Graph, meta *Meta) error {
@@ -38,10 +38,9 @@ func Save(dir string, g *Graph, meta *Meta) error {
 	putSlice(g.Weight, len(g.Weight))
 	putSlice(g.InDegree, len(g.InDegree))
 	putSlice(g.Region, len(g.Region))
-	for _, groups := range [][cells][]int32{g.OwnSensors, g.OppSensors} {
-		for _, s := range groups {
-			putSlice(s, len(s))
-		}
+	put(int64(len(g.SensorPools)))
+	for _, pool := range g.SensorPools {
+		putSlice(pool, len(pool))
 	}
 	putSlice(g.Readout, len(g.Readout))
 	if err == nil {
@@ -98,11 +97,10 @@ func Load(dir string) (*Graph, *Meta, error) {
 	get(g.InDegree)
 	g.Region = make([]uint8, length())
 	get(g.Region)
-	for _, groups := range []*[cells][]int32{&g.OwnSensors, &g.OppSensors} {
-		for c := range groups {
-			groups[c] = make([]int32, length())
-			get(groups[c])
-		}
+	g.SensorPools = make([][]int32, length())
+	for p := range g.SensorPools {
+		g.SensorPools[p] = make([]int32, length())
+		get(g.SensorPools[p])
 	}
 	g.Readout = make([]int32, length())
 	get(g.Readout)

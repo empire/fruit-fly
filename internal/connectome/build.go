@@ -1,5 +1,5 @@
-// Package connectome turns the MaleCNS v1.0 tables into a signed sparse graph plus the
-// fly's game interface (which neurons are the eyes, which are read out).
+// Package connectome turns the MaleCNS v1.0 tables into a signed sparse graph, plus the pools
+// of neurons a task can use: photoreceptors to stimulate and motor-side neurons to read out.
 //
 // The recipe follows nftechie/doomfly and seanphan/flyt3, with one important change:
 //   - neurons: every non-glia body with an assigned superclass (drops unassigned fragments)
@@ -10,7 +10,8 @@
 //     the brain, because photoreceptors release histamine.
 //   - strength: log1p(synapse count) / sqrt(out-degree + 1), so hub neurons don't explode
 //
-// The wiring is never changed afterwards. Nothing about tic-tac-toe is stored in it.
+// The wiring is never changed afterwards. Nothing about any game is stored in it: package
+// retina decides how a game's board is dealt onto the photoreceptor pools.
 package connectome
 
 import (
@@ -24,13 +25,13 @@ import (
 	"github.com/empire/fruit-fly/internal/download"
 )
 
-const (
-	cells    = 9
-	perClass = 512 // read out this many descending neurons and this many VNC motor neurons
-)
+const perClass = 512 // read out this many descending neurons and this many VNC motor neurons
 
 // Regions groups neurons for the activity display.
 var Regions = [3]string{"optic", "central", "vnc"}
+
+// SensorPoolNames names Graph.SensorPools in order.
+var SensorPoolNames = []string{"R1-R6", "R8"}
 
 // Inhibitory lists the neurotransmitters treated as inhibitory.
 var Inhibitory = []string{"gaba", "glutamate"}
@@ -46,9 +47,8 @@ type Graph struct {
 	InDegree []float32 // [N]
 	Region   []uint8   // [N] index into Regions
 
-	OwnSensors [cells][]int32 // R1-R6 photoreceptors per board cell: "my pieces"
-	OppSensors [cells][]int32 // R8 photoreceptors per board cell: "opponent's pieces"
-	Readout    []int32        // 512 descending + 512 VNC motor neurons
+	SensorPools [][]int32 // photoreceptor pools, see SensorPoolNames
+	Readout     []int32   // 512 descending + 512 VNC motor neurons
 }
 
 // Meta describes the graph and names the readout neurons.
@@ -164,7 +164,7 @@ func Build(rawDir, outDir string) (*Graph, *Meta, error) {
 		}
 	}
 
-	// ---- the game interface ------------------------------------------------
+	// ---- sensor pools and readout neurons ------------------------------------
 	var r16, r8, dn, mn []int32
 	for i := range n {
 		switch {
@@ -179,8 +179,7 @@ func Build(rawDir, outDir string) (*Graph, *Meta, error) {
 		}
 		g.Region[i] = region(superclass[i])
 	}
-	g.OwnSensors = deal(r16)
-	g.OppSensors = deal(r8)
+	g.SensorPools = [][]int32{r16, r8}
 	dn, mn = topByOutDegree(dn, outDegree, perClass), topByOutDegree(mn, outDegree, perClass)
 	g.Readout = append(slices.Clone(dn), mn...)
 
@@ -203,21 +202,8 @@ func Build(rawDir, outDir string) (*Graph, *Meta, error) {
 	}
 
 	fmt.Printf("inhibitory neurons (%s): %.1f%%\n", strings.Join(Inhibitory, ", "), 100*meta.InhibitoryFraction)
-	fmt.Printf("sensors: %d R1-R6 + %d R8, readout: %d DN + %d motor\n",
-		len(g.OwnSensors[0])*cells, len(g.OppSensors[0])*cells, len(dn), len(mn))
+	fmt.Printf("sensors: %d R1-R6 + %d R8, readout: %d DN + %d motor\n", len(r16), len(r8), len(dn), len(mn))
 	return g, meta, Save(outDir, g, meta)
-}
-
-// deal splits neurons into 9 equal groups like dealing cards (the remainder is dropped).
-// The dataset has no eye coordinates for photoreceptors, so this is a fixed arbitrary
-// assignment, not a real spatial map of the board onto the retina.
-func deal(neurons []int32) [cells][]int32 {
-	var groups [cells][]int32
-	per := len(neurons) / cells
-	for k, i := range neurons[:per*cells] {
-		groups[k%cells] = append(groups[k%cells], i)
-	}
-	return groups
 }
 
 func topByOutDegree(neurons []int32, outDegree []float64, n int) []int32 {

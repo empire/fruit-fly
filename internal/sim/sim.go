@@ -10,9 +10,10 @@
 // The simulation is event-driven: only neurons that just spiked (a few percent) walk
 // their outgoing connections, so a tick costs far less than touching all 25.6M synapses.
 //
-// Each board is simulated independently on its own goroutine. Every board starts from
-// the same seeded resting state, so the eyes are the only thing that differs, and the
-// same board always produces exactly the same spikes (live or cached).
+// Each stimulus is simulated independently on its own goroutine. Every run starts from
+// the same seeded resting state, so the stimulus is the only thing that differs, and the
+// same stimulus always produces exactly the same spikes (live or cached). The simulator
+// knows nothing about games: package retina turns a board into a stimulus.
 //
 // The parameters are engineering choices, not measured biology. They keep activity alive
 // but bounded, which is all this demo needs.
@@ -25,7 +26,6 @@ import (
 	"sync"
 
 	"github.com/empire/fruit-fly/internal/connectome"
-	"github.com/empire/fruit-fly/internal/game"
 )
 
 // Params controls the neuron model.
@@ -34,20 +34,23 @@ type Params struct {
 	Decay      float32 // fraction of voltage kept each tick
 	Gain       float32 // base threshold = Gain * sqrt(in-degree + 1)
 	BiasStd    float32 // per-neuron resting input, fixed during a run
-	OwnDrive   float32 // current into each R1-R6 photoreceptor under my piece
-	OppDrive   float32 // current into each R8 photoreceptor under an opponent piece
 	HomeoK     float32 // how strongly the threshold rises with the firing rate
 	TargetRate float32 // firing rate (spikes per tick) the threshold steers toward
-	Seed       uint64  // the fly's resting state; the same for every board
+	Seed       uint64  // the fly's resting state; the same for every run
 }
 
 // DefaultParams are the settings used for the cached features.
 func DefaultParams() Params {
-	return Params{Ticks: 48, Decay: 0.85, Gain: 0.15, BiasStd: 0.01, OwnDrive: 0.5, OppDrive: 0.5,
-		HomeoK: 3, TargetRate: 0.03, Seed: 0}
+	return Params{Ticks: 48, Decay: 0.85, Gain: 0.15, BiasStd: 0.01, HomeoK: 3, TargetRate: 0.03, Seed: 0}
 }
 
-// Result is what one board did to the brain.
+// Input is constant extra current into a group of neurons for the whole run.
+type Input struct {
+	Neurons []int32
+	Current float32
+}
+
+// Result is what one stimulus did to the brain.
 type Result struct {
 	ReadoutCounts []uint8    // spikes per readout neuron over the run
 	RegionSpikes  [3][]int32 // spikes per region (optic/central/vnc) per tick
@@ -58,8 +61,8 @@ type Brain struct {
 	G     *connectome.Graph
 	P     Params
 	theta []float32 // base threshold per neuron
-	bias  []float32 // resting input per neuron (same for every board)
-	v0    []float32 // starting voltage per neuron (same for every board)
+	bias  []float32 // resting input per neuron (same for every run)
+	v0    []float32 // starting voltage per neuron (same for every run)
 }
 
 // New prepares a brain. Params can't change afterwards.
@@ -74,7 +77,7 @@ func New(g *connectome.Graph, p Params) *Brain {
 	return b
 }
 
-// state holds one board's working buffers, reused across runs.
+// state holds one run's working buffers, reused across runs.
 type state struct {
 	v, rate, input, current []float32
 	spikes                  []int32
@@ -87,10 +90,10 @@ func (b *Brain) newState() *state {
 		current: make([]float32, n), spikes: make([]int32, 0, n/10), fired: make([]bool, n)}
 }
 
-// Run simulates one board.
-func (b *Brain) Run(p game.Pos) Result { return b.run(b.newState(), p) }
+// Run simulates one stimulus.
+func (b *Brain) Run(stimulus []Input) Result { return b.run(b.newState(), stimulus) }
 
-func (b *Brain) run(s *state, pos game.Pos) Result {
+func (b *Brain) run(s *state, stimulus []Input) Result {
 	g, p := b.G, b.P
 	copy(s.v, b.v0)
 	copy(s.input, b.bias)
@@ -100,17 +103,10 @@ func (b *Brain) run(s *state, pos game.Pos) Result {
 	}
 	s.spikes = s.spikes[:0]
 
-	// The eyes: pieces on the board become constant extra input to photoreceptors.
-	for c := range 9 {
-		if pos.Mine>>c&1 == 1 {
-			for _, i := range g.OwnSensors[c] {
-				s.input[i] += p.OwnDrive
-			}
-		}
-		if pos.Opp>>c&1 == 1 {
-			for _, i := range g.OppSensors[c] {
-				s.input[i] += p.OppDrive
-			}
+	// The stimulus: constant extra input, e.g. photoreceptors under pieces on the board.
+	for _, in := range stimulus {
+		for _, i := range in.Neurons {
+			s.input[i] += in.Current
 		}
 	}
 
@@ -153,24 +149,24 @@ func (b *Brain) run(s *state, pos game.Pos) Result {
 	return res
 }
 
-// RunMany simulates boards in parallel, one goroutine per CPU. Results keep input order.
-// progress, if not nil, is called after each finished board.
-func (b *Brain) RunMany(positions []game.Pos, progress func()) []Result {
-	results := make([]Result, len(positions))
+// RunMany simulates stimuli in parallel, one goroutine per CPU. Results keep input order.
+// progress, if not nil, is called after each finished run.
+func (b *Brain) RunMany(stimuli [][]Input, progress func()) []Result {
+	results := make([]Result, len(stimuli))
 	jobs := make(chan int)
 	var wg sync.WaitGroup
 	for range runtime.GOMAXPROCS(0) {
 		wg.Go(func() {
 			s := b.newState()
 			for j := range jobs {
-				results[j] = b.run(s, positions[j])
+				results[j] = b.run(s, stimuli[j])
 				if progress != nil {
 					progress()
 				}
 			}
 		})
 	}
-	for j := range positions {
+	for j := range stimuli {
 		jobs <- j
 	}
 	close(jobs)

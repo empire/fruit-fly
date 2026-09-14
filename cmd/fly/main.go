@@ -1,46 +1,63 @@
-// Command fly plays tic-tac-toe with a simulated MaleCNS v1.0 fruit-fly brain.
+// Command fly plays board games with a simulated MaleCNS v1.0 fruit-fly brain.
 //
-// Run the pipeline in order: download, build, features, train, eval, play.
+// Run the pipeline in order: download, build, then per game: features, train, eval, play.
+// Pick the game with -game (see `fly games`); the default is tic-tac-toe.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/empire/fruit-fly/internal/analyze"
 	"github.com/empire/fruit-fly/internal/connectome"
 	"github.com/empire/fruit-fly/internal/download"
 	"github.com/empire/fruit-fly/internal/features"
+	"github.com/empire/fruit-fly/internal/featureset"
+	"github.com/empire/fruit-fly/internal/game"
+	"github.com/empire/fruit-fly/internal/games"
 	"github.com/empire/fruit-fly/internal/play"
 	"github.com/empire/fruit-fly/internal/readout"
+	"github.com/empire/fruit-fly/internal/retina"
 	"github.com/empire/fruit-fly/internal/sim"
 )
 
 const (
+	dataDir      = "data"
 	rawDir       = "data/raw"
 	processedDir = "data/processed"
-	featuresPath = "data/features.bin"
 )
 
-func readoutPath(name string) string { return "data/readout_" + name + ".bin" }
+func featuresPath(t *game.Tree) string {
+	return filepath.Join(games.DataDir(dataDir, t), "features.bin")
+}
+
+func readoutPath(t *game.Tree, set string) string {
+	return filepath.Join(games.DataDir(dataDir, t), "readout_"+set+".bin")
+}
 
 // loadReadout builds a readout on a feature set and loads its trained weights.
-func loadReadout(name string) (*readout.Readout, error) {
-	x, err := readout.FeatureMatrix(name, featuresPath)
+func loadReadout(t *game.Tree, set string) (*readout.Readout, error) {
+	x, err := featureset.Matrix(set, t, featuresPath(t))
 	if err != nil {
 		return nil, err
 	}
-	r := readout.New(x)
-	return r, r.Load(readoutPath(name))
+	r := readout.New(t, x)
+	return r, r.Load(readoutPath(t, set))
 }
 
-func loadBrain() (*sim.Brain, *connectome.Meta, error) {
+// loadBrain loads the connectome and fits the eyes to the game's board.
+func loadBrain(t *game.Tree) (*sim.Brain, *retina.Eyes, *connectome.Meta, error) {
 	g, meta, err := connectome.Load(processedDir)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return sim.New(g, sim.DefaultParams()), meta, nil
+	eyes, err := retina.New(g, t.Layout, retina.DefaultDrive)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return sim.New(g, sim.DefaultParams()), eyes, meta, nil
 }
 
 type command struct {
@@ -56,6 +73,13 @@ func register(name, help string, run func(args []string) error) {
 	order = append(order, name)
 }
 
+// gameFlags creates a flag set for a subcommand with the -game flag. Call tree after Parse.
+func gameFlags(name string) (fs *flag.FlagSet, tree func() (*game.Tree, error)) {
+	fs = flags(name)
+	spec := fs.String("game", "tictactoe", "game to play (see `fly games`)")
+	return fs, func() (*game.Tree, error) { return games.Lookup(*spec) }
+}
+
 func init() {
 	register("download", "fetch the MaleCNS v1.0 tables (~1.1 GB)", func([]string) error {
 		return download.All(rawDir)
@@ -64,28 +88,53 @@ func init() {
 		_, _, err := connectome.Build(rawDir, processedDir)
 		return err
 	})
-	register("bench", "time the simulation on this machine", func([]string) error {
-		brain, _, err := loadBrain()
-		if err != nil {
-			return err
+	register("games", "list the games", func([]string) error {
+		for _, line := range games.Names() {
+			fmt.Println("  " + line)
 		}
-		features.Bench(brain)
 		return nil
 	})
-	register("features", "simulate every position once and cache readout spikes", func([]string) error {
-		brain, _, err := loadBrain()
+	register("bench", "time the simulation on this machine", func(args []string) error {
+		fs, tree := gameFlags("bench")
+		fs.Parse(args)
+		t, err := tree()
 		if err != nil {
 			return err
 		}
-		c, err := features.Compute(brain, featuresPath)
+		brain, eyes, _, err := loadBrain(t)
+		if err != nil {
+			return err
+		}
+		features.Bench(brain, eyes, t)
+		return nil
+	})
+	register("features", "simulate every position once and cache readout spikes", func(args []string) error {
+		fs, tree := gameFlags("features")
+		fs.Parse(args)
+		t, err := tree()
+		if err != nil {
+			return err
+		}
+		brain, eyes, _, err := loadBrain(t)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("%s: %d positions\n", t.Name, t.Decisions)
+		c, err := features.Compute(brain, eyes, t, featuresPath(t))
 		if err != nil {
 			return err
 		}
 		features.Sanity(c)
 		return nil
 	})
-	register("sanity", "does the brain's output depend on the board?", func([]string) error {
-		c, err := features.Load(featuresPath)
+	register("sanity", "does the brain's output depend on the board?", func(args []string) error {
+		fs, tree := gameFlags("sanity")
+		fs.Parse(args)
+		t, err := tree()
+		if err != nil {
+			return err
+		}
+		c, err := features.Load(featuresPath(t), t)
 		if err != nil {
 			return err
 		}
@@ -93,89 +142,119 @@ func init() {
 		return nil
 	})
 	register("train", "train the linear readout with self-play REINFORCE", func(args []string) error {
-		fs := flags("train")
+		fs, tree := gameFlags("train")
 		set := fs.String("features", "all", "brain, random, board or all")
-		games := fs.Int("games", 300_000, "training games per readout")
+		gamesN := fs.Int("games", 300_000, "training games per readout")
 		seed := fs.Uint64("seed", 0, "random seed for training games")
 		fs.Parse(args)
-		names := readout.FeatureSets
+		t, err := tree()
+		if err != nil {
+			return err
+		}
+		names := featureset.Names
 		if *set != "all" {
 			names = []string{*set}
 		}
 		for _, name := range names {
-			x, err := readout.FeatureMatrix(name, featuresPath)
+			x, err := featureset.Matrix(name, t, featuresPath(t))
 			if err != nil {
 				return err
 			}
 			cfg := readout.DefaultTrainConfig()
-			cfg.Games = *games
+			cfg.Games = *gamesN
 			cfg.Seed = *seed
-			if err := readout.Train(name, x, cfg).Save(readoutPath(name)); err != nil {
+			if err := readout.Train(name, t, x, cfg).Save(readoutPath(t, name)); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
 	register("eval", "compare the fly with baselines", func(args []string) error {
-		fs := flags("eval")
-		games := fs.Int("games", 4000, "games per column")
+		fs, tree := gameFlags("eval")
+		gamesN := fs.Int("games", 4000, "games per column")
 		fs.Parse(args)
+		t, err := tree()
+		if err != nil {
+			return err
+		}
 		row := func(label string, s readout.Score) {
 			r, p := s.VsRandom, s.VsPerfect
 			fmt.Printf("%-34s %5.1f%% %5.1f%% %5.1f%%   %5.1f%% %5.1f%% %5.1f%%\n", label,
 				100*r.Win, 100*r.Draw, 100*r.Loss, 100*p.Win, 100*p.Draw, 100*p.Loss)
 		}
-		fmt.Printf("%-34s %-22s   %s\n", "", "   vs random player", "   vs perfect player")
+		fmt.Printf("%-34s %-22s   %s\n", t.Name, "   vs random player", "   vs perfect player")
 		fmt.Printf("%-34s %6s %6s %6s   %6s %6s %6s\n", "player", "win", "draw", "loss", "win", "draw", "loss")
-		row("random moves (baseline)", readout.Evaluate(readout.RandomChooser, *games, 0))
-		for _, name := range readout.FeatureSets {
-			r, err := loadReadout(name)
+		row("random moves (baseline)", readout.Evaluate(t, readout.RandomChooser(t), *gamesN, 0))
+		for _, name := range featureset.Names {
+			r, err := loadReadout(t, name)
 			if err != nil {
-				fmt.Printf("%-34s (not trained: %v)\n", readout.Labels[name], err)
+				fmt.Printf("%-34s (not trained: %v)\n", featureset.Label(name, t), err)
 				continue
 			}
-			row(readout.Labels[name], readout.Evaluate(r.Chooser(), *games, 0))
+			row(featureset.Label(name, t), readout.Evaluate(t, r.Chooser(), *gamesN, 0))
 		}
-		fmt.Printf("\n%d games per column, half as X and half as O. The perfect player never loses,\n"+
-			"so 'loss' there is how often the player blunders.\n", *games)
+		fmt.Printf("\n%d games per column, half moving first and half second. %s\n", *gamesN, perfectPlay(t))
 		return nil
 	})
-	register("analyze", "why does the brain readout play worse? three experiments", func([]string) error {
+	register("analyze", "why does the brain readout play worse? three experiments", func(args []string) error {
+		fs, tree := gameFlags("analyze")
+		fs.Parse(args)
+		t, err := tree()
+		if err != nil {
+			return err
+		}
 		sets := map[string][][]float64{}
-		for _, name := range readout.FeatureSets {
-			x, err := readout.FeatureMatrix(name, featuresPath)
+		for _, name := range featureset.Names {
+			x, err := featureset.Matrix(name, t, featuresPath(t))
 			if err != nil {
 				return err
 			}
 			sets[name] = x
 		}
-		analyze.Run(sets)
+		analyze.Run(t, sets)
 		return nil
 	})
 	register("play", "play against the fly in the terminal", func(args []string) error {
-		fs := flags("play")
-		sideFlag := fs.String("side", "x", "your side: x (moves first) or o")
+		fs, tree := gameFlags("play")
+		second := fs.Bool("second", false, "let the fly move first")
+		sideFlag := fs.String("side", "", "tic-tac-toe style alias: x moves first, o second")
 		live := fs.Bool("live", false, "re-run the full simulation on every fly move")
 		fs.Parse(args)
-		r, err := loadReadout("brain")
+		t, err := tree()
 		if err != nil {
 			return err
 		}
-		cache, err := features.Load(featuresPath)
+		r, err := loadReadout(t, "brain")
 		if err != nil {
 			return err
 		}
-		brain, meta, err := loadBrain()
+		cache, err := features.Load(featuresPath(t), t)
+		if err != nil {
+			return err
+		}
+		brain, eyes, meta, err := loadBrain(t)
 		if err != nil {
 			return err
 		}
 		fly := &play.Fly{Readout: r, Cache: cache, Meta: meta}
 		if *live {
-			fly.Brain = brain
+			fly.Brain, fly.Eyes = brain, eyes
 		}
-		play.Game(fly, *sideFlag != "o", os.Stdin, os.Stdout)
+		play.Game(fly, t, !*second && *sideFlag != "o", os.Stdin, os.Stdout)
 		return nil
 	})
+}
+
+// perfectPlay explains what "vs perfect" means for this game.
+func perfectPlay(t *game.Tree) string {
+	switch t.Value[t.Root] {
+	case 0:
+		return "The game is a draw under\nperfect play, so 'loss' against the perfect player is how often the player blunders."
+	case 1:
+		return "The first player wins under\nperfect play, so against the perfect player only the games moving first can be saved."
+	default:
+		return "The second player wins under\nperfect play, so against the perfect player only the games moving second can be saved."
+	}
 }
 
 func usage() {

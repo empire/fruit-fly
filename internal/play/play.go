@@ -1,4 +1,4 @@
-// Package play is the terminal game against the fly.
+// Package play is the terminal game against the fly, for any game.Tree.
 package play
 
 import (
@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -15,14 +14,13 @@ import (
 	"github.com/empire/fruit-fly/internal/features"
 	"github.com/empire/fruit-fly/internal/game"
 	"github.com/empire/fruit-fly/internal/readout"
+	"github.com/empire/fruit-fly/internal/retina"
 	"github.com/empire/fruit-fly/internal/sim"
 )
 
 const (
 	bold  = "\033[1m"
 	dim   = "\033[2m"
-	red   = "\033[31m"
-	cyan  = "\033[36m"
 	reset = "\033[0m"
 )
 
@@ -31,66 +29,60 @@ type Fly struct {
 	Readout *readout.Readout
 	Cache   *features.Cache
 	Meta    *connectome.Meta
-	Brain   *sim.Brain // nil unless playing live
+	Brain   *sim.Brain   // nil unless playing live
+	Eyes    *retina.Eyes // needed when playing live
 }
 
-// Game runs one game. The human types cells 1-9 on in; everything is written to out.
-func Game(fly *Fly, humanIsX bool, in io.Reader, out io.Writer) {
+// Game runs one game of t. The human types moves on in; everything is written to out.
+func Game(fly *Fly, t *game.Tree, humanFirst bool, in io.Reader, out io.Writer) {
 	scanner := bufio.NewScanner(in)
-	var pos game.Pos
-	xToMove := true
-	fmt.Fprintf(out, "\n  you are %s, the fly is %s\n\n", side(humanIsX), side(!humanIsX))
-	showBoard(out, pos, xToMove)
+	node, firstToMove := t.Root, true
+	fmt.Fprintf(out, "\n  %s: you move %s, the fly moves %s\n\n", t.Name, order(humanFirst), order(!humanFirst))
+	showBoard(out, t, node, firstToMove)
 	for {
-		result, over := pos.Terminal()
-		if over {
-			switch {
+		if t.IsTerminal(node) {
+			switch result := t.Value[node]; {
 			case result == 0:
 				fmt.Fprint(out, "\n  draw\n\n")
-			case xToMove == humanIsX: // the side to move has just lost
+			case (result < 0) == (firstToMove == humanFirst): // the side to move lost, or won
 				fmt.Fprint(out, "\n  the fly wins\n\n")
 			default:
 				fmt.Fprint(out, "\n  you win\n\n")
 			}
 			return
 		}
-		var cell int
-		if xToMove == humanIsX {
+		var action int
+		if firstToMove == humanFirst {
 			var ok bool
-			if cell, ok = ask(scanner, out, pos); !ok {
+			if action, ok = ask(scanner, out, t, node, firstToMove); !ok {
 				return
 			}
 		} else {
-			cell = fly.move(out, pos)
+			action = fly.move(out, t, node, firstToMove)
 		}
-		pos = pos.Play(cell)
-		xToMove = !xToMove
+		node = int(t.Next[node][action])
+		firstToMove = !firstToMove
 		fmt.Fprintln(out)
-		showBoard(out, pos, xToMove)
+		showBoard(out, t, node, firstToMove)
 	}
 }
 
-func side(x bool) string {
-	if x {
-		return "X"
+func order(first bool) string {
+	if first {
+		return "first"
 	}
-	return "O"
+	return "second"
 }
 
-func showBoard(out io.Writer, pos game.Pos, xToMove bool) {
-	for i, row := range game.Render(pos, xToMove) {
-		row = strings.ReplaceAll(row, "X", bold+red+"X"+reset)
-		row = strings.ReplaceAll(row, "O", bold+cyan+"O"+reset)
+func showBoard(out io.Writer, t *game.Tree, node int, firstToMove bool) {
+	for _, row := range t.Render(node, firstToMove) {
 		fmt.Fprintln(out, "   "+row)
-		if i < 2 {
-			fmt.Fprintln(out, "   ---+---+---")
-		}
 	}
 }
 
-func ask(scanner *bufio.Scanner, out io.Writer, pos game.Pos) (int, bool) {
+func ask(scanner *bufio.Scanner, out io.Writer, t *game.Tree, row int, firstToMove bool) (int, bool) {
 	for {
-		fmt.Fprint(out, "  your move (1-9, q to quit): ")
+		fmt.Fprintf(out, "  your move (%s, q to quit): ", t.InputHint())
 		if !scanner.Scan() {
 			return 0, false
 		}
@@ -98,28 +90,28 @@ func ask(scanner *bufio.Scanner, out io.Writer, pos game.Pos) (int, bool) {
 		if text == "q" {
 			return 0, false
 		}
-		if n, err := strconv.Atoi(text); err == nil && slices.Contains(pos.Legal(), n-1) {
-			return n - 1, true
+		if action, ok := t.ParseAction(row, firstToMove, text); ok {
+			return action, true
 		}
-		fmt.Fprintln(out, "  that cell isn't free")
+		fmt.Fprintln(out, "  that move isn't legal")
 	}
 }
 
-func (f *Fly) move(out io.Writer, pos game.Pos) int {
-	row := readout.GetTables().RowOf(pos)
+func (f *Fly) move(out io.Writer, t *game.Tree, row int, firstToMove bool) int {
 	counts, regions := f.Cache.Counts[row], f.Cache.Regions[row]
 
 	if f.Brain != nil {
 		fmt.Fprintf(out, "%s  simulating %d neurons for %d ticks ...", dim, f.Brain.G.N, f.Brain.P.Ticks)
 		start := time.Now()
-		live := f.Brain.Run(pos)
+		live := f.Brain.Run(f.Eyes.Stimulus(t.Obs[row]))
 		fmt.Fprintf(out, " %.1fs, matches cache: %v%s\n", time.Since(start).Seconds(),
 			slices.Equal(live.ReadoutCounts, counts), reset)
 		counts, regions = live.ReadoutCounts, live.RegionSpikes
 	}
 
 	probs := f.Readout.Probs(row)
-	cell := f.Readout.Greedy(row)
+	action := f.Readout.Greedy(row)
+	name := func(a int) string { return t.ActionName(row, firstToMove, a) }
 
 	fmt.Fprintf(out, "\n  %sfly brain activity%s (spikes per tick)\n", bold, reset)
 	for r, name := range connectome.Regions {
@@ -127,19 +119,22 @@ func (f *Fly) move(out io.Writer, pos game.Pos) int {
 	}
 
 	fmt.Fprintf(out, "\n  %smove probabilities%s\n", bold, reset)
-	for r := range 3 {
-		fmt.Fprint(out, "  ")
-		for c := r * 3; c < r*3+3; c++ {
-			if !readout.GetTables().Legal[row][c] {
-				fmt.Fprint(out, "     .")
-			} else {
-				fmt.Fprintf(out, "  %3.0f%%", 100*probs[c])
-			}
+	if board, ok := t.ProbabilityBoard(row, probs); ok {
+		for _, line := range board {
+			fmt.Fprintln(out, "  "+line)
 		}
-		fmt.Fprintln(out)
+	} else {
+		legal := t.LegalActions(row)
+		slices.SortStableFunc(legal, func(a, b int) int { return -cmpFloat(probs[a], probs[b]) })
+		for _, a := range legal[:min(8, len(legal))] {
+			fmt.Fprintf(out, "   %-8s %3.0f%%\n", name(a), 100*probs[a])
+		}
+		if len(legal) > 8 {
+			fmt.Fprintf(out, "   %s... %d more%s\n", dim, len(legal)-8, reset)
+		}
 	}
 
-	// Which firing readout neurons pushed the chosen cell up? weight × standardized activity.
+	// Which firing readout neurons pushed the chosen move up? weight × standardized activity.
 	// (A silent neuron can "vote" too, by being quieter than usual; we only list ones that fired.)
 	x := f.Readout.X[row]
 	type voter struct {
@@ -149,12 +144,12 @@ func (f *Fly) move(out io.Writer, pos game.Pos) int {
 	var voters []voter
 	for k, n := range counts {
 		if n > 0 {
-			voters = append(voters, voter{k, f.Readout.W[cell][k] * x[k]})
+			voters = append(voters, voter{k, f.Readout.W[action][k] * x[k]})
 		}
 	}
 	slices.SortFunc(voters, func(a, b voter) int { return -cmpFloat(a.vote, b.vote) })
-	fmt.Fprintf(out, "\n  %sfiring neurons voting for cell %d%s (%d of %d readout neurons fired)\n",
-		bold, cell+1, reset, len(voters), len(counts))
+	fmt.Fprintf(out, "\n  %sfiring neurons voting for %s%s (%d of %d readout neurons fired)\n",
+		bold, name(action), reset, len(voters), len(counts))
 	if len(voters) == 0 {
 		fmt.Fprintf(out, "   %snone fired: the choice comes from which neurons stayed quiet%s\n", dim, reset)
 	}
@@ -163,12 +158,12 @@ func (f *Fly) move(out io.Writer, pos game.Pos) int {
 		if f.Meta.ReadoutClasses[v.neuron] == "descending_neuron" {
 			kind = "descending"
 		}
-		name := f.Meta.ReadoutTypes[v.neuron]
+		neuron := f.Meta.ReadoutTypes[v.neuron]
 		fmt.Fprintf(out, "   %22s  %-10s %3d spikes  %svote %+.2f%s\n",
-			name[:min(22, len(name))], kind, counts[v.neuron], dim, v.vote, reset)
+			neuron[:min(22, len(neuron))], kind, counts[v.neuron], dim, v.vote, reset)
 	}
-	fmt.Fprintf(out, "\n  %sthe fly plays %d%s\n\n", bold, cell+1, reset)
-	return cell
+	fmt.Fprintf(out, "\n  %sthe fly plays %s%s\n\n", bold, name(action), reset)
+	return action
 }
 
 func cmpFloat(a, b float64) int {

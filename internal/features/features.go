@@ -57,13 +57,20 @@ func Compute(brain *sim.Brain, eyes *retina.Eyes, t *game.Tree, path string) (*C
 				return
 			case <-tick.C:
 				n := done.Load()
-				fmt.Printf("\r  simulated %d / %d positions (%.0fs)", n, len(positions), time.Since(start).Seconds())
+				elapsed := time.Since(start).Seconds()
+				rate, left := 0.0, 0.0
+				if n > 0 && elapsed > 0 {
+					rate = float64(n) / elapsed
+					left = elapsed * float64(int64(len(positions))-n) / float64(n)
+				}
+				fmt.Printf("\r  simulated %*d / %d positions (%3.0fs, %3.0f/s, ~%3.0fs left)\033[K",
+					len(fmt.Sprint(len(positions))), n, len(positions), elapsed, rate, left)
 			}
 		}
 	}()
 	results := brain.RunMany(positions, func() { done.Add(1) })
 	close(stop)
-	fmt.Printf("\r  simulated %d positions x %d ticks in %.1fs\n", len(positions), brain.P.Ticks, time.Since(start).Seconds())
+	fmt.Printf("\r  simulated %d positions x %d ticks in %.1fs\033[K\n", len(positions), brain.P.Ticks, time.Since(start).Seconds())
 
 	c := &Cache{Ticks: brain.P.Ticks}
 	for _, r := range results {

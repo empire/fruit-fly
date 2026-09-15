@@ -64,14 +64,14 @@ func Save(dir string, g *Graph, meta *Meta) error {
 func Load(dir string) (*Graph, *Meta, error) {
 	f, err := os.Open(filepath.Join(dir, "graph.bin"))
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w (run `fly build` first)", err)
+		return nil, nil, err
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20)
 
 	magic := make([]byte, len(graphMagic))
 	if _, err := io.ReadFull(r, magic); err != nil || string(magic) != graphMagic {
-		return nil, nil, fmt.Errorf("graph.bin: bad header (rebuild with `fly build`)")
+		return nil, nil, fmt.Errorf("graph.bin: bad header")
 	}
 	g := &Graph{}
 	get := func(v any) {

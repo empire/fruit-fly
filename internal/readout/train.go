@@ -5,6 +5,7 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/empire/fruit-fly/internal/featureset"
 	"github.com/empire/fruit-fly/internal/game"
@@ -102,7 +103,7 @@ type TrainConfig struct {
 	LR       float64
 	Entropy  float64
 	Seed     uint64
-	LogEvery int // batches between progress lines
+	LogEvery int // batches between win/loss snapshots
 }
 
 // DefaultTrainConfig trains for 300,000 games in batches of 512.
@@ -124,6 +125,20 @@ func Train(name string, t *game.Tree, x [][]float64, cfg TrainConfig) *Readout {
 		grads[w] = newGrad(r.A, r.D)
 	}
 	seedRng := rand.New(rand.NewPCG(cfg.Seed, 1))
+
+	start := time.Now()
+	trained := 0
+	progress := func() {
+		elapsed := time.Since(start).Seconds()
+		left := ""
+		if trained > 0 && elapsed > 0 {
+			sec := elapsed * float64(cfg.Games-trained) / float64(trained)
+			if sec >= 1 {
+				left = fmt.Sprintf("  ~%.0fs left", sec)
+			}
+		}
+		fmt.Printf("\r  trained %8d / %d games%s\033[K", trained, cfg.Games, left)
+	}
 
 	for it := range cfg.Games / cfg.Batch {
 		opponent := Opponent(it % 3)
@@ -163,12 +178,15 @@ func Train(name string, t *game.Tree, x [][]float64, cfg TrainConfig) *Readout {
 		}
 		opt.step(r, total, 1/float64(n))
 
-		if (it+1)%cfg.LogEvery == 0 {
+		trained += cfg.Batch
+		progress()
+		if cfg.LogEvery > 0 && (it+1)%cfg.LogEvery == 0 {
 			s := Evaluate(t, r.Chooser(), 400, uint64(it))
-			fmt.Printf("[%s] games %8d  vs random: win %3.0f%%  vs perfect: loss %3.0f%%\n",
-				name, (it+1)*cfg.Batch, 100*s.VsRandom.Win, 100*s.VsPerfect.Loss)
+			fmt.Printf("\r[%s] games %8d / %d  vs random: win %3.0f%%  vs perfect: loss %3.0f%%\033[K\n",
+				name, trained, cfg.Games, 100*s.VsRandom.Win, 100*s.VsPerfect.Loss)
 		}
 	}
+	fmt.Printf("\r[%s] trained %d games in %.1fs\033[K\n", name, trained, time.Since(start).Seconds())
 	return r
 }
 

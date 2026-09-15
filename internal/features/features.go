@@ -116,7 +116,7 @@ func (c *Cache) Save(path string) error {
 func Load(path string, t *game.Tree) (*Cache, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("%w (run `fly features -game %s` first)", err, t.Name)
+		return nil, err
 	}
 	defer f.Close()
 	r := bufio.NewReader(f)

@@ -302,7 +302,7 @@ func (r *Readout) Save(path string) error {
 func (r *Readout) Load(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("%w (run `fly train -game %s` first)", err, r.Tree.Name)
+		return err
 	}
 	defer f.Close()
 	rd := bufio.NewReader(f)

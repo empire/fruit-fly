@@ -5,10 +5,12 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/empire/fruit-fly/internal/analyze"
 	"github.com/empire/fruit-fly/internal/connectome"
@@ -37,21 +39,31 @@ func readoutPath(t *game.Tree, set string) string {
 	return filepath.Join(games.DataDir(dataDir, t), "readout_"+set+".bin")
 }
 
+func loadCache(t *game.Tree) (*features.Cache, error) {
+	c, err := features.Load(featuresPath(t), t)
+	return c, need(err, "features", t.Name)
+}
+
+func loadMatrix(set string, t *game.Tree) ([][]float64, error) {
+	x, err := featureset.Matrix(set, t, featuresPath(t))
+	return x, need(err, "features", t.Name)
+}
+
 // loadReadout builds a readout on a feature set and loads its trained weights.
 func loadReadout(t *game.Tree, set string) (*readout.Readout, error) {
-	x, err := featureset.Matrix(set, t, featuresPath(t))
+	x, err := loadMatrix(set, t)
 	if err != nil {
 		return nil, err
 	}
 	r := readout.New(t, x)
-	return r, r.Load(readoutPath(t, set))
+	return r, need(r.Load(readoutPath(t, set)), "train", t.Name)
 }
 
 // loadBrain loads the connectome and fits the eyes to the game's board.
 func loadBrain(t *game.Tree) (*sim.Brain, *retina.Eyes, *connectome.Meta, error) {
 	g, meta, err := connectome.Load(processedDir)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, need(err, "build", "")
 	}
 	eyes, err := retina.New(g, t.Layout, retina.DefaultDrive)
 	if err != nil {
@@ -129,6 +141,7 @@ func init() {
 			return err
 		}
 		features.Sanity(c)
+		fmt.Printf("next: %s\n", next("train", fs))
 		return nil
 	})
 	register("sanity", "does the brain's output depend on the board?", func(args []string) error {
@@ -138,7 +151,7 @@ func init() {
 		if err != nil {
 			return err
 		}
-		c, err := features.Load(featuresPath(t), t)
+		c, err := loadCache(t)
 		if err != nil {
 			return err
 		}
@@ -160,7 +173,7 @@ func init() {
 			names = []string{*set}
 		}
 		for _, name := range names {
-			x, err := featureset.Matrix(name, t, featuresPath(t))
+			x, err := loadMatrix(name, t)
 			if err != nil {
 				return err
 			}
@@ -171,6 +184,7 @@ func init() {
 				return err
 			}
 		}
+		fmt.Printf("next: %s\n", next("play", fs))
 		return nil
 	})
 	register("eval", "compare the fly with baselines", func(args []string) error {
@@ -218,7 +232,7 @@ func init() {
 		}
 		sets := map[string][][]float64{}
 		for _, name := range featureset.Names {
-			x, err := featureset.Matrix(name, t, featuresPath(t))
+			x, err := loadMatrix(name, t)
 			if err != nil {
 				return err
 			}
@@ -241,7 +255,7 @@ func init() {
 		if err != nil {
 			return err
 		}
-		cache, err := features.Load(featuresPath(t), t)
+		cache, err := loadCache(t)
 		if err != nil {
 			return err
 		}
@@ -268,6 +282,44 @@ func perfectPlay(t *game.Tree) string {
 	default:
 		return "The second player wins under\nperfect play, so against the perfect player only the games moving second can be saved."
 	}
+}
+
+func next(step string, fs *flag.FlagSet) string {
+	cmd := self() + " " + step
+	if g := fs.Lookup("game"); g != nil && g.Value.String() != "tictactoe" {
+		cmd += " -game " + g.Value.String()
+	}
+	return cmd
+}
+
+func need(err error, step, game string) error {
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	cmd := self() + " " + step
+	if game != "" {
+		cmd += " -game " + game
+	}
+	return fmt.Errorf("%w (run `%s` first)", err, cmd)
+}
+
+func self() string {
+	if goRun(os.Args[0]) {
+		return "go run ./cmd/fly"
+	}
+	if exe, err := os.Executable(); err == nil && goRun(exe) {
+		return "go run ./cmd/fly"
+	}
+	return os.Args[0]
+}
+
+func goRun(p string) bool {
+	p = filepath.ToSlash(p)
+	if strings.Contains(p, "/go-build") {
+		return true
+	}
+	cache := filepath.ToSlash(os.Getenv("GOCACHE"))
+	return cache != "" && cache != "off" && strings.HasPrefix(p, strings.TrimSuffix(cache, "/")+"/")
 }
 
 func usage() {

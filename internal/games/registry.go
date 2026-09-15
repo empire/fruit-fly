@@ -10,6 +10,7 @@ import (
 
 	"github.com/empire/fruit-fly/internal/game"
 	"github.com/empire/fruit-fly/internal/games/hexapawn"
+	"github.com/empire/fruit-fly/internal/games/othello"
 	"github.com/empire/fruit-fly/internal/games/tictactoe"
 )
 
@@ -25,6 +26,12 @@ var registry = map[string]entry{
 			return nil, fmt.Errorf("tictactoe takes no size")
 		}
 		return game.Compile(tictactoe.New())
+	}},
+	"othello": {"8x8 Othello (Reversi); sampled, not enumerated", func(args string) (*game.Tree, error) {
+		if args != "" {
+			return nil, fmt.Errorf("othello takes no size")
+		}
+		return game.Sample(othello.New(), othello.SampleSize, 0)
 	}},
 	"hexapawn": {"pawns only; default 3 wide x 4 tall, or hexapawn:COLSxROWS", func(args string) (*game.Tree, error) {
 		cols, rows := 3, 4

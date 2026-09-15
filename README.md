@@ -15,8 +15,8 @@ board ──► photoreceptors ──► 25.6M frozen synapses ──► 1,024 d
 ```
 
 Only the final linear readout learns. The wiring is never changed. Nothing in the brain, the
-simulator or the trainer is specific to a game. Small games are enumerated; large ones are
-sampled. Adding another game is one package (see [Adding a game](#adding-a-game)).
+simulator or the trainer is specific to a game. Small games are enumerated; 8x8 Othello is
+sampled (128 positions). Adding another game is one package (see [Adding a game](#adding-a-game)).
 
 ## Run it
 
@@ -27,7 +27,7 @@ Go 1.27+, CPU only, about 10 minutes end to end on a 16-core laptop. The only de
 go build -o fly ./cmd/fly
 ./fly download    # ~1.1 GB into data/raw, 16 parallel range requests (honours HTTPS_PROXY)
 ./fly build       # feathers -> signed sparse graph (~25 s)
-./fly games       # tictactoe, hexapawn (3x4, or hexapawn:COLSxROWS)
+./fly games       # tictactoe, hexapawn (3x4, or hexapawn:COLSxROWS), othello (8x8 sample)
 
 # per game; -game defaults to tictactoe, files go to data/<game>/
 ./fly bench       # how fast is one simulation here?
@@ -49,18 +49,18 @@ brain knows nothing about games, and one small adapter (the retina) joins them.
 ```
 cmd/fly ─► play ─► analyze, readout, featureset, features ─► retina ─► sim ─► connectome
                                │                               │
-                               └──────────► game ◄─────────────┘ ◄── games/{tictactoe,hexapawn}
+                               └──────────► game ◄─────────────┘ ◄── games/{tictactoe,hexapawn,othello}
 ```
 
 | layer | package | what happens |
 |---|---|---|
 | game (domain) | `internal/game` | the `Game[S]` interface (rules, observation, text UI); `Compile` enumerates a small game, `Sample` keeps a random subset of a large one; `Walk` plays the real rules; everything downstream uses a `Tree` |
-| games | `internal/games/...` | `tictactoe`, `hexapawn`, and the registry behind `-game` |
+| games | `internal/games/...` | `tictactoe`, `hexapawn`, `othello`, and the registry behind `-game` |
 | data | `internal/download` | 3 flat tables: neuron annotations, predicted neurotransmitters, connection weights |
 | wiring | `internal/connectome` | keep the 166,700 neurons; strength = `log1p(synapses) / sqrt(out-degree+1)`; negative if the sending neuron releases GABA or glutamate; photoreceptor pools (3,377 R1-R6, 1,329 R8) and readout = top 512 descending + top 512 VNC motor neurons |
 | brain | `internal/sim` | leaky integrate-and-fire neurons with adaptive thresholds; event-driven (only neurons that just spiked send current); input is a list of neuron groups and currents; one goroutine per run |
 | eyes | `internal/retina` | channel *c* of the board (0: my pieces, 1: opponent's) uses pool *c* (R1-R6, R8), dealt into one equal group per cell |
-| cache | `internal/features` | the brain is frozen; interned decision positions are simulated once (every position of a compiled game, or a random sample of a large one) |
+| cache | `internal/features` | the brain is frozen; interned decision positions are simulated once (all of tic-tac-toe / Hexapawn, a 128-position sample of 8x8 Othello) |
 | inputs | `internal/featureset` | brain spike counts, plus two same-size controls: random ReLU features and the raw board |
 | learning | `internal/readout` | `scores = W · activity + b`, one score per action, illegal actions masked; REINFORCE with a value baseline against a mix of self, random and perfect opponents; gradients and Adam written by hand and checked by a finite-difference test |
 | diagnosis | `internal/analyze` | smoothness, held-out probe, memorization ceiling |

@@ -3,30 +3,35 @@ package game
 import (
 	"cmp"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 )
 
-// Tree is a compiled game: every reachable position, numbered, with its moves and results.
+// Tree is a set of interned positions plus the rules, so the same tables work for a
+// complete enumeration (tic-tac-toe) and a small random sample (8x8 Othello).
 //
 // Nodes 0..Decisions-1 are positions where someone must move ("rows", sorted by Key); the
-// remaining nodes are finished games. Everything that learns or plays indexes these tables
-// instead of calling the rules, so it works for any game.
+// remaining interned nodes are finished games. Play uses Walk, which follows the rules
+// even when a position is not in the tree.
 type Tree struct {
 	Name       string
 	Layout     Layout
 	NumActions int
-	Decisions  int       // number of positions that need a move
+	Decisions  int       // interned positions that need a move
 	Root       int       // the starting position
-	Next       [][]int32 // [row][action] -> node after the move, -1 if illegal
-	Value      []int8    // [node] result for the side to move under perfect play (-1, 0, +1)
-	Best       [][]bool  // [row][action] the move achieves Value
+	Partial    bool      // true if this is a sample, not every reachable position
+	Next       [][]int32 // [row][action] -> interned node, -1 if illegal or unseen
+	Value      []int8    // [node] result for interned terminals; decisions if solved
+	Best       [][]bool  // [row][action] optimal; nil when Partial
 	Obs        [][]bool  // [row] what the fly sees
 
 	obsIndex map[string]int32
+	legal    func(row int) []int
+	newWalk  func() *Walk
 	ui       ui
 }
 
-// ui holds the game's text functions, bound to the tree's states.
+// ui holds the game's text functions, bound to interned states.
 type ui struct {
 	render     func(node int, firstToMove bool) []string
 	parse      func(node int, firstToMove bool, text string) (int, bool)
@@ -37,7 +42,6 @@ type ui struct {
 
 // Compile enumerates every reachable position of g and solves it with minimax.
 func Compile[S comparable](g Game[S]) (*Tree, error) {
-	// 1. Every reachable state, split into decisions and finished games.
 	var decisions, terminals []S
 	seen := map[S]bool{}
 	stack := []S{g.Start()}
@@ -62,15 +66,82 @@ func Compile[S comparable](g Game[S]) (*Tree, error) {
 			stack = append(stack, g.Play(s, a))
 		}
 	}
+	return finish(g, decisions, terminals, false)
+}
 
-	// 2. Number them: decisions by key, then finished games by key.
-	byKey := func(a, b S) int { return cmp.Compare(g.Key(a), g.Key(b)) }
+// Sample builds a tree from at most limit unique decision positions, found by playing
+// random games. Use this when the game is too large to enumerate. The rules still play
+// the full game; only the interned rows get a brain cache and a perfect-play label is
+// not computed.
+func Sample[S comparable](g Game[S], limit int, seed uint64) (*Tree, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("%s: sample limit %d, want at least 1", g.Name(), limit)
+	}
+	rng := rand.New(rand.NewPCG(seed, 1))
+	seen := map[S]bool{}
+	var decisions, terminals []S
+	var legal []int
+
+	add := func(s S) {
+		if seen[s] {
+			return
+		}
+		if _, over := g.Outcome(s); over {
+			seen[s] = true
+			terminals = append(terminals, s)
+			return
+		}
+		if len(decisions) >= limit {
+			return
+		}
+		seen[s] = true
+		decisions = append(decisions, s)
+	}
+
+	add(g.Start())
+	stuck := 0
+	for len(decisions) < limit {
+		before := len(decisions)
+		s := g.Start()
+		for {
+			add(s)
+			if _, over := g.Outcome(s); over {
+				break
+			}
+			legal = g.Legal(s, legal[:0])
+			if len(legal) == 0 {
+				return nil, fmt.Errorf("%s: a position that is not over has no legal moves", g.Name())
+			}
+			s = g.Play(s, legal[rng.IntN(len(legal))])
+		}
+		if len(decisions) == before {
+			stuck++
+			if stuck > 32 {
+				break
+			}
+		} else {
+			stuck = 0
+		}
+	}
+	return finish(g, decisions, terminals, true)
+}
+
+func finish[S comparable](g Game[S], decisions, terminals []S, partial bool) (*Tree, error) {
+	byKey := func(a, b S) int {
+		if c := cmp.Compare(g.Key(a), g.Key(b)); c != 0 {
+			return c
+		}
+		if a == b {
+			return 0
+		}
+		return cmp.Compare(fmt.Sprintf("%#v", a), fmt.Sprintf("%#v", b))
+	}
 	slices.SortFunc(decisions, byKey)
 	slices.SortFunc(terminals, byKey)
 	states := append(decisions, terminals...)
 	index := make(map[S]int32, len(states))
 	for i, s := range states {
-		if i > 0 && g.Key(states[i-1]) == g.Key(s) && i != len(decisions) {
+		if !partial && i > 0 && g.Key(states[i-1]) == g.Key(s) && i != len(decisions) {
 			return nil, fmt.Errorf("%s: two states share key %d", g.Name(), g.Key(s))
 		}
 		index[s] = int32(i)
@@ -78,11 +149,14 @@ func Compile[S comparable](g Game[S]) (*Tree, error) {
 
 	layout := g.Layout()
 	t := &Tree{Name: g.Name(), Layout: layout, NumActions: g.NumActions(), Decisions: len(decisions),
-		Root: int(index[g.Start()]), Next: make([][]int32, len(decisions)),
-		Value: make([]int8, len(states)), Best: make([][]bool, len(decisions)),
-		Obs: make([][]bool, len(decisions)), obsIndex: make(map[string]int32, len(decisions))}
+		Partial: partial, Root: int(index[g.Start()]), Next: make([][]int32, len(decisions)),
+		Value: make([]int8, len(states)), Obs: make([][]bool, len(decisions)),
+		obsIndex: make(map[string]int32, len(decisions))}
+	if !partial {
+		t.Best = make([][]bool, len(decisions))
+	}
 
-	// 3. Moves and observations.
+	var legal []int
 	for row, s := range decisions {
 		t.Next[row] = make([]int32, t.NumActions)
 		for a := range t.Next[row] {
@@ -92,7 +166,9 @@ func Compile[S comparable](g Game[S]) (*Tree, error) {
 			if a < 0 || a >= t.NumActions {
 				return nil, fmt.Errorf("%s: action %d outside 0..%d", g.Name(), a, t.NumActions-1)
 			}
-			t.Next[row][a] = index[g.Play(s, a)]
+			if next, ok := index[g.Play(s, a)]; ok {
+				t.Next[row][a] = next
+			}
 		}
 		t.Obs[row] = make([]bool, layout.Size())
 		g.Observe(s, t.Obs[row])
@@ -102,13 +178,21 @@ func Compile[S comparable](g Game[S]) (*Tree, error) {
 		}
 	}
 
-	// 4. Results under perfect play.
 	for i, s := range terminals {
 		v, _ := g.Outcome(s)
 		t.Value[len(decisions)+i] = int8(v)
 	}
-	t.solve()
+	if !partial {
+		t.solve()
+	}
 
+	t.legal = func(row int) []int {
+		if row < 0 || row >= t.Decisions {
+			return nil
+		}
+		return g.Legal(states[row], nil)
+	}
+	t.newWalk = func() *Walk { return newWalk(t, g, index) }
 	t.ui = ui{
 		render: func(n int, first bool) []string { return g.Render(states[n], first) },
 		parse:  func(n int, first bool, text string) (int, bool) { return g.ParseAction(states[n], first, text) },
@@ -123,6 +207,43 @@ func Compile[S comparable](g Game[S]) (*Tree, error) {
 	return t, nil
 }
 
+func newWalk[S comparable](t *Tree, g Game[S], index map[S]int32) *Walk {
+	s := g.Start()
+	w := &Walk{Tree: t, First: true}
+	obs := make([]bool, t.Layout.Size())
+	sync := func() {
+		if i, ok := index[s]; ok {
+			w.Row = int(i)
+		} else {
+			w.Row = -1
+		}
+		v, over := g.Outcome(s)
+		w.Value, w.Over = v, over
+		w.Legal = nil
+		if !over {
+			w.Legal = g.Legal(s, nil)
+		}
+		clear(obs)
+		g.Observe(s, obs)
+		w.obs = slices.Clone(obs)
+		w.render = g.Render(s, w.First)
+		first := w.First
+		cur := s
+		w.parse = func(text string) (int, bool) { return g.ParseAction(cur, first, text) }
+		w.name = func(a int) string { return g.ActionName(cur, first, a) }
+		if pb, ok := g.(ProbabilityBoard[S]); ok {
+			w.probs = func(p []float64) []string { return pb.ProbabilityBoard(cur, p) }
+		}
+	}
+	w.step = func(action int) {
+		s = g.Play(s, action)
+		w.First = !w.First
+		sync()
+	}
+	sync()
+	return w
+}
+
 func obsKey(obs []bool) string {
 	b := make([]byte, len(obs))
 	for i, v := range obs {
@@ -133,14 +254,17 @@ func obsKey(obs []bool) string {
 	return string(b)
 }
 
-// Nodes is the number of positions, finished games included.
+// Nodes is the number of interned positions, finished games included.
 func (t *Tree) Nodes() int { return len(t.Value) }
 
-// IsTerminal reports whether a node is a finished game.
+// IsTerminal reports whether an interned node is a finished game.
 func (t *Tree) IsTerminal(node int) bool { return node >= t.Decisions }
 
-// LegalActions returns the legal actions of a row in increasing order.
+// LegalActions returns the legal actions of an interned decision row, from the rules.
 func (t *Tree) LegalActions(row int) []int {
+	if t.legal != nil {
+		return t.legal(row)
+	}
 	var actions []int
 	for a, next := range t.Next[row] {
 		if next >= 0 {
@@ -150,19 +274,27 @@ func (t *Tree) LegalActions(row int) []int {
 	return actions
 }
 
-// RowOfObservation finds a decision position that looks exactly like obs.
+// RowOfObservation finds an interned decision position that looks exactly like obs.
 func (t *Tree) RowOfObservation(obs []bool) (int, bool) {
 	row, ok := t.obsIndex[obsKey(obs)]
 	return int(row), ok
 }
 
-// Render draws a node; firstToMove says whether the player who started is to move.
+// Render draws an interned node; firstToMove says whether the player who started is to move.
 func (t *Tree) Render(node int, firstToMove bool) []string { return t.ui.render(node, firstToMove) }
 
-// ParseAction reads a human move typed at a decision position.
+// ParseAction reads a human move typed at an interned decision position.
 func (t *Tree) ParseAction(row int, firstToMove bool, text string) (int, bool) {
 	a, ok := t.ui.parse(row, firstToMove, text)
-	return a, ok && a >= 0 && a < t.NumActions && t.Next[row][a] >= 0
+	if !ok || a < 0 || a >= t.NumActions {
+		return 0, false
+	}
+	for _, legal := range t.LegalActions(row) {
+		if legal == a {
+			return a, true
+		}
+	}
+	return 0, false
 }
 
 // ActionName writes an action the way a human would type it.

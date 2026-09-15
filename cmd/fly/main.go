@@ -119,7 +119,11 @@ func init() {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%s: %d positions\n", t.Name, t.Decisions)
+		if t.Partial {
+			fmt.Printf("%s: %d sampled positions\n", t.Name, t.Decisions)
+		} else {
+			fmt.Printf("%s: %d positions\n", t.Name, t.Decisions)
+		}
 		c, err := features.Compute(brain, eyes, t, featuresPath(t))
 		if err != nil {
 			return err
@@ -179,12 +183,17 @@ func init() {
 		}
 		row := func(label string, s readout.Score) {
 			r, p := s.VsRandom, s.VsPerfect
+			if t.Partial {
+				fmt.Printf("%-34s %5.1f%% %5.1f%% %5.1f%%      n/a    n/a    n/a\n", label,
+					100*r.Win, 100*r.Draw, 100*r.Loss)
+				return
+			}
 			fmt.Printf("%-34s %5.1f%% %5.1f%% %5.1f%%   %5.1f%% %5.1f%% %5.1f%%\n", label,
 				100*r.Win, 100*r.Draw, 100*r.Loss, 100*p.Win, 100*p.Draw, 100*p.Loss)
 		}
 		fmt.Printf("%-34s %-22s   %s\n", t.Name, "   vs random player", "   vs perfect player")
 		fmt.Printf("%-34s %6s %6s %6s   %6s %6s %6s\n", "player", "win", "draw", "loss", "win", "draw", "loss")
-		row("random moves (baseline)", readout.Evaluate(t, readout.RandomChooser(t), *gamesN, 0))
+		row("random moves (baseline)", readout.Evaluate(t, readout.RandomChooser(), *gamesN, 0))
 		for _, name := range featureset.Names {
 			r, err := loadReadout(t, name)
 			if err != nil {
@@ -193,7 +202,11 @@ func init() {
 			}
 			row(featureset.Label(name, t), readout.Evaluate(t, r.Chooser(), *gamesN, 0))
 		}
-		fmt.Printf("\n%d games per column, half moving first and half second. %s\n", *gamesN, perfectPlay(t))
+		if t.Partial {
+			fmt.Printf("\n%d games per column, half moving first and half second. Sample of %d positions; vs perfect is n/a.\n", *gamesN, t.Decisions)
+		} else {
+			fmt.Printf("\n%d games per column, half moving first and half second. %s\n", *gamesN, perfectPlay(t))
+		}
 		return nil
 	})
 	register("analyze", "why does the brain readout play worse? three experiments", func(args []string) error {
@@ -237,7 +250,7 @@ func init() {
 			return err
 		}
 		fly := &play.Fly{Readout: r, Cache: cache, Meta: meta}
-		if *live {
+		if *live || t.Partial {
 			fly.Brain, fly.Eyes = brain, eyes
 		}
 		play.Game(fly, t, !*second && *sideFlag != "o", os.Stdin, os.Stdout)

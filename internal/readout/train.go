@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 
+	"github.com/empire/fruit-fly/internal/featureset"
 	"github.com/empire/fruit-fly/internal/game"
 )
 
@@ -18,55 +19,63 @@ const (
 	Perfect
 )
 
-// Chooser picks an action for a decision position (given by tree row).
-type Chooser func(row int, rng *rand.Rand) int
+// Chooser picks an action at the current position of a Walk.
+type Chooser func(w *game.Walk, rng *rand.Rand) int
 
-func opponentMove(t *game.Tree, o Opponent, row int, rng *rand.Rand) int {
-	if o == Perfect {
-		return game.PerfectMove(t, row, rng)
+func opponentMove(t *game.Tree, o Opponent, w *game.Walk, rng *rand.Rand) int {
+	if w.Row < 0 {
+		return w.Legal[rng.IntN(len(w.Legal))]
 	}
-	return game.RandomMove(t, row, rng)
+	if o == Perfect {
+		return game.PerfectMove(t, w.Row, rng)
+	}
+	return game.RandomMove(t, w.Row, rng)
 }
 
 // playGame plays one game on t and returns the result for the first player (+1, 0, -1).
 // If learn is set, it records every learner move of r as a Sample with its Return filled in.
 func playGame(t *game.Tree, fly Chooser, r *Readout, o Opponent, flyFirst bool, rng *rand.Rand, learn bool) (int, []Sample) {
 	var (
-		node    = t.Root
+		w       = t.NewWalk()
 		samples []Sample
 		steps   []int
 	)
 	for step := 0; ; step++ {
-		if t.IsTerminal(node) {
-			v := int(t.Value[node]) // for the side to move
-			outcomeFirst := v
+		if w.Over {
+			outcomeFirst := w.Value
 			if step%2 == 1 {
-				outcomeFirst = -v
+				outcomeFirst = -w.Value
 			}
 			for i := range samples {
 				samples[i].Return = float64(outcomeFirst)
-				if steps[i]%2 == 1 { // the second player moved: flip to their point of view
+				if steps[i]%2 == 1 {
 					samples[i].Return = -samples[i].Return
 				}
 			}
 			return outcomeFirst, samples
 		}
-		row := node
 		firstMoves := step%2 == 0
 		var action int
 		if o == Self || flyFirst == firstMoves {
-			if learn {
-				p := r.Probs(row)
+			if learn && w.Row < 0 && r.enc == nil {
+				action = w.Legal[rng.IntN(len(w.Legal))]
+			} else if learn {
+				p := r.ProbsWalk(w)
 				action = sampleAction(p, rng)
-				samples = append(samples, Sample{Row: row, Action: action, Probs: p, Value: r.Value(row)})
+				s := Sample{Row: w.Row, Action: action, Probs: p, Value: r.ValueWalk(w)}
+				if w.Row < 0 {
+					s.X = r.scaled(w.Obs())
+					s.Row = 0
+				}
+				samples = append(samples, s)
 				steps = append(steps, step)
 			} else {
-				action = fly(row, rng)
+				action = fly(w, rng)
 			}
 		} else {
-			action = opponentMove(t, o, row, rng)
+			action = opponentMove(t, o, w, rng)
 		}
-		node = int(t.Next[row][action])
+		w.Step(action)
 	}
 }
 
@@ -83,7 +92,7 @@ func sampleAction(p []float64, rng *rand.Rand) int {
 		}
 		u -= pc
 	}
-	return last // rounding
+	return last
 }
 
 // TrainConfig controls REINFORCE training.
@@ -105,6 +114,9 @@ func DefaultTrainConfig() TrainConfig {
 // learner itself (teaches both sides), a random player and a perfect player (keep it honest).
 func Train(name string, t *game.Tree, x [][]float64, cfg TrainConfig) *Readout {
 	r := New(t, x)
+	if enc, err := featureset.Encoder(name, t.Layout); err == nil && enc != nil {
+		r.AttachEncoder(enc)
+	}
 	opt := newAdam(r.A, r.D, cfg.LR)
 	workers := runtime.GOMAXPROCS(0)
 	grads := make([]*Grad, workers)
@@ -160,5 +172,7 @@ func Train(name string, t *game.Tree, x [][]float64, cfg TrainConfig) *Readout {
 	return r
 }
 
-// Chooser plays the readout's most likely move.
-func (r *Readout) Chooser() Chooser { return func(row int, _ *rand.Rand) int { return r.Greedy(row) } }
+// Chooser plays the readout's most likely move, including off-tree positions.
+func (r *Readout) Chooser() Chooser {
+	return func(w *game.Walk, _ *rand.Rand) int { return r.GreedyWalk(w) }
+}

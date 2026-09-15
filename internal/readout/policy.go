@@ -30,6 +30,9 @@ type Readout struct {
 	X    [][]float64 // standardized features, [row][D]
 	D    int         // features
 	A    int         // actions
+	mean []float64
+	std  []float64
+	enc  func([]bool) []float64 // optional: features from any observation
 
 	W [][]float64 // [action][D] policy weights
 	B []float64   // [action] policy bias
@@ -40,12 +43,21 @@ type Readout struct {
 // New creates a readout for t on features x ([row][D]) that starts as a uniformly random
 // player (all weights zero).
 func New(t *game.Tree, x [][]float64) *Readout {
-	r := &Readout{Tree: t, X: Standardize(x), D: len(x[0]), A: t.NumActions, U: make([]float64, len(x[0]))}
+	out, mean, std := scale(x)
+	r := &Readout{Tree: t, X: out, D: len(x[0]), A: t.NumActions, mean: mean, std: std, U: make([]float64, len(x[0]))}
 	r.W, r.B = make([][]float64, r.A), make([]float64, r.A)
 	for c := range r.A {
 		r.W[c] = make([]float64, r.D)
 	}
 	return r
+}
+
+// AttachEncoder lets the readout score positions that are not interned, using the same
+// scaler as the training cache. Brain features have no encoder.
+func (r *Readout) AttachEncoder(enc func([]bool) []float64) { r.enc = enc }
+
+func (r *Readout) scaled(obs []bool) []float64 {
+	return applyScale(r.enc(obs), r.mean, r.std)
 }
 
 func dot(a, b []float64) float64 {
@@ -56,25 +68,19 @@ func dot(a, b []float64) float64 {
 	return s
 }
 
-// Probs returns move probabilities for a position; illegal actions get 0.
-func (r *Readout) Probs(row int) []float64 {
-	x, next := r.X[row], r.Tree.Next[row]
+// ProbsOn scores a feature vector with an explicit legal set (used for live play).
+func (r *Readout) ProbsOn(x []float64, legal []int) []float64 {
 	z := make([]float64, r.A)
 	top := math.Inf(-1)
-	for c := range r.A {
-		if next[c] >= 0 {
-			z[c] = dot(r.W[c], x) + r.B[c]
-			top = max(top, z[c])
-		}
+	for _, c := range legal {
+		z[c] = dot(r.W[c], x) + r.B[c]
+		top = max(top, z[c])
 	}
-	// softmax, shifted by the largest score so exp() can't overflow
 	p := make([]float64, r.A)
 	sum := 0.0
-	for c := range r.A {
-		if next[c] >= 0 {
-			p[c] = math.Exp(z[c] - top)
-			sum += p[c]
-		}
+	for _, c := range legal {
+		p[c] = math.Exp(z[c] - top)
+		sum += p[c]
 	}
 	for c := range p {
 		p[c] /= sum
@@ -82,19 +88,67 @@ func (r *Readout) Probs(row int) []float64 {
 	return p
 }
 
-// Value predicts the result (+1 win … -1 loss) for the side to move.
-func (r *Readout) Value(row int) float64 { return dot(r.U, r.X[row]) + r.C }
+func uniform(legal []int, a int) []float64 {
+	p := make([]float64, a)
+	if len(legal) == 0 {
+		return p
+	}
+	u := 1 / float64(len(legal))
+	for _, c := range legal {
+		p[c] = u
+	}
+	return p
+}
 
-// Greedy returns the most likely legal action.
-func (r *Readout) Greedy(row int) int {
-	p := r.Probs(row)
-	best := -1
-	for c := range r.A {
-		if r.Tree.Next[row][c] >= 0 && (best < 0 || p[c] > p[best]) {
+func greedyOf(p []float64, legal []int) int {
+	best := legal[0]
+	for _, c := range legal[1:] {
+		if p[c] > p[best] {
 			best = c
 		}
 	}
 	return best
+}
+
+// Probs returns move probabilities for an interned position; illegal actions get 0.
+func (r *Readout) Probs(row int) []float64 {
+	return r.ProbsOn(r.X[row], r.Tree.LegalActions(row))
+}
+
+// ProbsWalk scores the current position of a game, including sample misses.
+func (r *Readout) ProbsWalk(w *game.Walk) []float64 {
+	if w.Row >= 0 {
+		return r.Probs(w.Row)
+	}
+	if r.enc == nil {
+		return uniform(w.Legal, r.A)
+	}
+	return r.ProbsOn(r.scaled(w.Obs()), w.Legal)
+}
+
+// Value predicts the result (+1 win … -1 loss) for the side to move.
+func (r *Readout) Value(row int) float64 { return dot(r.U, r.X[row]) + r.C }
+
+// ValueWalk is Value at an interned row, or the encoder's value off-tree.
+func (r *Readout) ValueWalk(w *game.Walk) float64 {
+	if w.Row >= 0 {
+		return r.Value(w.Row)
+	}
+	if r.enc == nil {
+		return 0
+	}
+	return dot(r.U, r.scaled(w.Obs())) + r.C
+}
+
+// Greedy returns the most likely legal action of an interned row.
+func (r *Readout) Greedy(row int) int {
+	legal := r.Tree.LegalActions(row)
+	return greedyOf(r.Probs(row), legal)
+}
+
+// GreedyWalk is Greedy at an interned row, or the encoder / uniform off-tree.
+func (r *Readout) GreedyWalk(w *game.Walk) int {
+	return greedyOf(r.ProbsWalk(w), w.Legal)
 }
 
 // Sample is one move the learner made, with what it knew at the time.
@@ -104,6 +158,7 @@ type Sample struct {
 	Return float64   // final result from the mover's point of view
 	Probs  []float64 // policy when the move was chosen
 	Value  float64   // value prediction when the move was chosen
+	X      []float64 // set when Row < 0 (off-tree features)
 }
 
 // Grad has the same shape as the readout's parameters.
@@ -145,7 +200,10 @@ func (g *Grad) zero() {
 // and z[k] = W[k]·x + B[k], v = U·x + C, so each weight's gradient is that times x.
 // The finite-difference test in policy_test.go checks this derivation numerically.
 func (r *Readout) Accumulate(g *Grad, s Sample, entropy float64) {
-	x := r.X[s.Row]
+	x := s.X
+	if x == nil {
+		x = r.X[s.Row]
+	}
 	adv := s.Return - s.Value
 	h := 0.0
 	for _, p := range s.Probs {
@@ -277,8 +335,13 @@ func (r *Readout) Load(path string) error {
 // Standardize rescales each feature to mean 0 and standard deviation 1 across positions,
 // so no feature dominates just because its numbers are bigger. Constant features become 0.
 func Standardize(x [][]float64) [][]float64 {
+	out, _, _ := scale(x)
+	return out
+}
+
+func scale(x [][]float64) (out [][]float64, mean, std []float64) {
 	d := len(x[0])
-	mean, std := make([]float64, d), make([]float64, d)
+	mean, std = make([]float64, d), make([]float64, d)
 	for _, row := range x {
 		for k, v := range row {
 			mean[k] += v
@@ -298,12 +361,26 @@ func Standardize(x [][]float64) [][]float64 {
 			std[k] = 1
 		}
 	}
-	out := make([][]float64, len(x))
+	out = make([][]float64, len(x))
 	for i, row := range x {
-		out[i] = make([]float64, d)
-		for k, v := range row {
-			out[i][k] = (v - mean[k]) / std[k]
-		}
+		out[i] = applyScale(row, mean, std)
+	}
+	return out, mean, std
+}
+
+func applyScale(row, mean, std []float64) []float64 {
+	out := make([]float64, len(row))
+	for k, v := range row {
+		out[k] = (v - mean[k]) / std[k]
 	}
 	return out
+}
+
+// ScaleCounts standardizes live spike counts with the readout's training scaler.
+func (r *Readout) ScaleCounts(counts []uint8) []float64 {
+	raw := make([]float64, len(counts))
+	for i, v := range counts {
+		raw[i] = float64(v)
+	}
+	return applyScale(raw, r.mean, r.std)
 }

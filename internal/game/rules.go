@@ -1,13 +1,12 @@
 // Package game is the part of the program that knows what a game is, and nothing about brains.
 //
 // A game is described once, as Rules plus how it looks (Observer) and how a human talks to it
-// (TextUI). Compile then walks every reachable position and turns the game into a Tree: plain
-// tables of positions, moves, results and perfect play. Everything downstream (the brain cache,
-// training, evaluation, the terminal UI) works on a Tree, so it never needs to know which game
-// it is playing.
+// (TextUI). Compile enumerates every reachable position; Sample keeps a random subset when
+// the game is too large. Everything downstream works on a Tree. Play follows the rules
+// through Walk, so a sample still plays the real game.
 //
-// Supported games: two players who alternate, perfect information, and few enough positions to
-// enumerate them all (the brain is simulated once per position).
+// Supported games: two players who alternate and have perfect information. Small games are
+// enumerated; large ones are sampled (the brain is simulated once per interned position).
 package game
 
 // Rules are the mechanics of a game. A state S is always seen from the side to move, so the

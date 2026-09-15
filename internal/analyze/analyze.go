@@ -201,6 +201,11 @@ func Run(t *game.Tree, sets map[string][][]float64) {
 		}
 	}
 
+	if t.Partial {
+		fmt.Printf("\n2–3. held-out probe and memorization ceiling: n/a (sample tree, no perfect-play labels)\n")
+		return
+	}
+
 	rng := rand.New(rand.NewPCG(0, 4))
 	perm := rng.Perm(t.Decisions)
 	train, test := perm[:len(perm)*4/5], perm[len(perm)*4/5:]

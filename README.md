@@ -15,8 +15,8 @@ board ──► photoreceptors ──► 25.6M frozen synapses ──► 1,024 d
 ```
 
 Only the final linear readout learns. The wiring is never changed. Nothing in the brain, the
-simulator or the trainer is specific to a game: tic-tac-toe and Hexapawn ship, and adding another
-game is one package (see [Adding a game](#adding-a-game)).
+simulator or the trainer is specific to a game. Small games are enumerated; large ones are
+sampled. Adding another game is one package (see [Adding a game](#adding-a-game)).
 
 ## Run it
 
@@ -54,13 +54,13 @@ cmd/fly ─► play ─► analyze, readout, featureset, features ─► retina 
 
 | layer | package | what happens |
 |---|---|---|
-| game (domain) | `internal/game` | the `Game[S]` interface (rules, observation, text UI); `Compile` enumerates every reachable position into a `Tree` (moves, observations, minimax values, optimal moves) that everything downstream uses |
+| game (domain) | `internal/game` | the `Game[S]` interface (rules, observation, text UI); `Compile` enumerates a small game, `Sample` keeps a random subset of a large one; `Walk` plays the real rules; everything downstream uses a `Tree` |
 | games | `internal/games/...` | `tictactoe`, `hexapawn`, and the registry behind `-game` |
 | data | `internal/download` | 3 flat tables: neuron annotations, predicted neurotransmitters, connection weights |
 | wiring | `internal/connectome` | keep the 166,700 neurons; strength = `log1p(synapses) / sqrt(out-degree+1)`; negative if the sending neuron releases GABA or glutamate; photoreceptor pools (3,377 R1-R6, 1,329 R8) and readout = top 512 descending + top 512 VNC motor neurons |
 | brain | `internal/sim` | leaky integrate-and-fire neurons with adaptive thresholds; event-driven (only neurons that just spiked send current); input is a list of neuron groups and currents; one goroutine per run |
 | eyes | `internal/retina` | channel *c* of the board (0: my pieces, 1: opponent's) uses pool *c* (R1-R6, R8), dealt into one equal group per cell |
-| cache | `internal/features` | the brain is frozen and the games have few decision positions (tic-tac-toe 4,520, Hexapawn 3x4 479), so each is simulated once |
+| cache | `internal/features` | the brain is frozen; interned decision positions are simulated once (every position of a compiled game, or a random sample of a large one) |
 | inputs | `internal/featureset` | brain spike counts, plus two same-size controls: random ReLU features and the raw board |
 | learning | `internal/readout` | `scores = W · activity + b`, one score per action, illegal actions masked; REINFORCE with a value baseline against a mix of self, random and perfect opponents; gradients and Adam written by hand and checked by a finite-difference test |
 | diagnosis | `internal/analyze` | smoothness, held-out probe, memorization ceiling |
@@ -68,16 +68,18 @@ cmd/fly ─► play ─► analyze, readout, featureset, features ─► retina 
 
 ## Adding a game
 
-Supported: two players who alternate, perfect information, and few enough positions to simulate
-each one (about 65 ms per position on 16 cores, so ~100k positions is a couple of hours).
+Supported: two players who alternate and have perfect information. If the game is small enough
+to enumerate (about 65 ms per position on 16 cores), register `game.Compile`. If it is not,
+register `game.Sample` with a few hundred positions so `features` stays fast.
 
 1. Make `internal/games/<name>` with a state type `S` (comparable, seen from the side to move) and
    a type implementing `game.Game[S]`: `Start`, `Key`, `NumActions`, `Legal`, `Play`, `Outcome`,
    `Layout`/`Observe` (at most 2 channels, one per photoreceptor pool), and
    `Render`/`ParseAction`/`ActionName`/`InputHint` for the terminal. `ProbabilityBoard` is optional.
    `internal/games/hexapawn` is a complete example with its own board size and from→to actions.
-2. Add one entry to the registry in `internal/games/registry.go`.
-3. Test position counts and the perfect-play value against numbers computed independently.
+2. Add one entry to the registry in `internal/games/registry.go` (`Compile` or `Sample`).
+3. Test the rules against numbers computed independently. Enumerable games also check position
+   counts and the perfect-play value.
 4. `./fly features -game <name>`, then `train`, `eval`, `analyze`, `play`.
 
 ## Results

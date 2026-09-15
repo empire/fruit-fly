@@ -29,22 +29,22 @@ type Fly struct {
 	Readout *readout.Readout
 	Cache   *features.Cache
 	Meta    *connectome.Meta
-	Brain   *sim.Brain   // nil unless playing live
-	Eyes    *retina.Eyes // needed when playing live
+	Brain   *sim.Brain // used on cache misses and when -live
+	Eyes    *retina.Eyes
 }
 
 // Game runs one game of t. The human types moves on in; everything is written to out.
 func Game(fly *Fly, t *game.Tree, humanFirst bool, in io.Reader, out io.Writer) {
 	scanner := bufio.NewScanner(in)
-	node, firstToMove := t.Root, true
+	w := t.NewWalk()
 	fmt.Fprintf(out, "\n  %s: you move %s, the fly moves %s\n\n", t.Name, order(humanFirst), order(!humanFirst))
-	showBoard(out, t, node, firstToMove)
+	showBoard(out, w)
 	for {
-		if t.IsTerminal(node) {
-			switch result := t.Value[node]; {
-			case result == 0:
+		if w.Over {
+			switch {
+			case w.Value == 0:
 				fmt.Fprint(out, "\n  draw\n\n")
-			case (result < 0) == (firstToMove == humanFirst): // the side to move lost, or won
+			case (w.Value < 0) == (w.First == humanFirst):
 				fmt.Fprint(out, "\n  the fly wins\n\n")
 			default:
 				fmt.Fprint(out, "\n  you win\n\n")
@@ -52,18 +52,17 @@ func Game(fly *Fly, t *game.Tree, humanFirst bool, in io.Reader, out io.Writer) 
 			return
 		}
 		var action int
-		if firstToMove == humanFirst {
+		if w.First == humanFirst {
 			var ok bool
-			if action, ok = ask(scanner, out, t, node, firstToMove); !ok {
+			if action, ok = ask(scanner, out, w); !ok {
 				return
 			}
 		} else {
-			action = fly.move(out, t, node, firstToMove)
+			action = fly.move(out, w)
 		}
-		node = int(t.Next[node][action])
-		firstToMove = !firstToMove
+		w.Step(action)
 		fmt.Fprintln(out)
-		showBoard(out, t, node, firstToMove)
+		showBoard(out, w)
 	}
 }
 
@@ -74,15 +73,15 @@ func order(first bool) string {
 	return "second"
 }
 
-func showBoard(out io.Writer, t *game.Tree, node int, firstToMove bool) {
-	for _, row := range t.Render(node, firstToMove) {
+func showBoard(out io.Writer, w *game.Walk) {
+	for _, row := range w.Render() {
 		fmt.Fprintln(out, "   "+row)
 	}
 }
 
-func ask(scanner *bufio.Scanner, out io.Writer, t *game.Tree, row int, firstToMove bool) (int, bool) {
+func ask(scanner *bufio.Scanner, out io.Writer, w *game.Walk) (int, bool) {
 	for {
-		fmt.Fprintf(out, "  your move (%s, q to quit): ", t.InputHint())
+		fmt.Fprintf(out, "  your move (%s, q to quit): ", w.Tree.InputHint())
 		if !scanner.Scan() {
 			return 0, false
 		}
@@ -90,28 +89,45 @@ func ask(scanner *bufio.Scanner, out io.Writer, t *game.Tree, row int, firstToMo
 		if text == "q" {
 			return 0, false
 		}
-		if action, ok := t.ParseAction(row, firstToMove, text); ok {
+		if action, ok := w.ParseAction(text); ok {
 			return action, true
 		}
 		fmt.Fprintln(out, "  that move isn't legal")
 	}
 }
 
-func (f *Fly) move(out io.Writer, t *game.Tree, row int, firstToMove bool) int {
-	counts, regions := f.Cache.Counts[row], f.Cache.Regions[row]
+func (f *Fly) move(out io.Writer, w *game.Walk) int {
+	var counts []uint8
+	var regions [3][]int32
 
-	if f.Brain != nil {
+	if w.Row >= 0 && f.Cache != nil && w.Row < len(f.Cache.Counts) && f.Brain == nil {
+		counts, regions = f.Cache.Counts[w.Row], f.Cache.Regions[w.Row]
+	} else if w.Row >= 0 && f.Cache != nil && w.Row < len(f.Cache.Counts) && f.Brain != nil {
 		fmt.Fprintf(out, "%s  simulating %d neurons for %d ticks ...", dim, f.Brain.G.N, f.Brain.P.Ticks)
 		start := time.Now()
-		live := f.Brain.Run(f.Eyes.Stimulus(t.Obs[row]))
+		run := f.Brain.Run(f.Eyes.Stimulus(w.Obs()))
 		fmt.Fprintf(out, " %.1fs, matches cache: %v%s\n", time.Since(start).Seconds(),
-			slices.Equal(live.ReadoutCounts, counts), reset)
-		counts, regions = live.ReadoutCounts, live.RegionSpikes
+			slices.Equal(run.ReadoutCounts, f.Cache.Counts[w.Row]), reset)
+		counts, regions = run.ReadoutCounts, run.RegionSpikes
+	} else {
+		fmt.Fprintf(out, "%s  simulating %d neurons for %d ticks ...", dim, f.Brain.G.N, f.Brain.P.Ticks)
+		start := time.Now()
+		run := f.Brain.Run(f.Eyes.Stimulus(w.Obs()))
+		fmt.Fprintf(out, " %.1fs%s\n", time.Since(start).Seconds(), reset)
+		counts, regions = run.ReadoutCounts, run.RegionSpikes
 	}
 
-	probs := f.Readout.Probs(row)
-	action := f.Readout.Greedy(row)
-	name := func(a int) string { return t.ActionName(row, firstToMove, a) }
+	var probs []float64
+	var action int
+	if w.Row < 0 {
+		x := f.Readout.ScaleCounts(counts)
+		probs = f.Readout.ProbsOn(x, w.Legal)
+		action = greedyLegal(probs, w.Legal)
+	} else {
+		probs = f.Readout.ProbsWalk(w)
+		action = f.Readout.GreedyWalk(w)
+	}
+	name := func(a int) string { return w.ActionName(a) }
 
 	fmt.Fprintf(out, "\n  %sfly brain activity%s (spikes per tick)\n", bold, reset)
 	for r, name := range connectome.Regions {
@@ -119,12 +135,12 @@ func (f *Fly) move(out io.Writer, t *game.Tree, row int, firstToMove bool) int {
 	}
 
 	fmt.Fprintf(out, "\n  %smove probabilities%s\n", bold, reset)
-	if board, ok := t.ProbabilityBoard(row, probs); ok {
+	if board, ok := w.ProbabilityBoard(probs); ok {
 		for _, line := range board {
 			fmt.Fprintln(out, "  "+line)
 		}
 	} else {
-		legal := t.LegalActions(row)
+		legal := slices.Clone(w.Legal)
 		slices.SortStableFunc(legal, func(a, b int) int { return -cmpFloat(probs[a], probs[b]) })
 		for _, a := range legal[:min(8, len(legal))] {
 			fmt.Fprintf(out, "   %-8s %3.0f%%\n", name(a), 100*probs[a])
@@ -134,9 +150,12 @@ func (f *Fly) move(out io.Writer, t *game.Tree, row int, firstToMove bool) int {
 		}
 	}
 
-	// Which firing readout neurons pushed the chosen move up? weight × standardized activity.
-	// (A silent neuron can "vote" too, by being quieter than usual; we only list ones that fired.)
-	x := f.Readout.X[row]
+	x := f.Readout.X[0]
+	if w.Row >= 0 {
+		x = f.Readout.X[w.Row]
+	} else {
+		x = f.Readout.ScaleCounts(counts)
+	}
 	type voter struct {
 		neuron int
 		vote   float64
@@ -164,6 +183,16 @@ func (f *Fly) move(out io.Writer, t *game.Tree, row int, firstToMove bool) int {
 	}
 	fmt.Fprintf(out, "\n  %sthe fly plays %s%s\n\n", bold, name(action), reset)
 	return action
+}
+
+func greedyLegal(p []float64, legal []int) int {
+	best := legal[0]
+	for _, c := range legal[1:] {
+		if p[c] > p[best] {
+			best = c
+		}
+	}
+	return best
 }
 
 func cmpFloat(a, b float64) int {
